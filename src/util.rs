@@ -120,12 +120,24 @@ pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 /// Write `data` to `path` via a temp file and rename, with the given mode.
+/// The temp file is synced before the rename and the directory after it,
+/// so a crash right after leaves the old file or the new one, never an
+/// empty one.
 pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, data)?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
-    fs::rename(&tmp, path)
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.set_permissions(fs::Permissions::from_mode(mode))?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::File::open(d)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Open (creating it, mode 0600) a lock file for [`flock_exclusive`].
@@ -219,6 +231,20 @@ mod tests {
             assert!(!try_lock(&b), "a second open of the lock file must wait");
         }
         assert!(try_lock(&b), "released on drop");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_replaces_whole_file() {
+        let dir = std::env::temp_dir().join(format!("oc-atomic-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.json");
+        fs::write(&p, "old old old").unwrap();
+        write_atomic(&p, b"new", 0o640).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"new");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "no temp file left");
         let _ = fs::remove_dir_all(&dir);
     }
 

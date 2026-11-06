@@ -106,8 +106,23 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The saved config, or the defaults. A config that does not parse is
+    /// moved aside to `<name>.bad-<unix time>` first, so the next save
+    /// cannot overwrite the user's profiles for good.
     pub fn load(path: &Path) -> Config {
-        let mut c: Config = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mut c: Config = match std::fs::read(path) {
+            Err(_) => Config::default(),
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
+                let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let bad = path.with_file_name(format!("{name}.bad-{secs}"));
+                match std::fs::rename(path, &bad) {
+                    Ok(()) => eprintln!("omarchy-ocd: {}: {e}; moved it to {} and started from defaults", path.display(), bad.display()),
+                    Err(re) => eprintln!("omarchy-ocd: {}: {e}; could not move it aside ({re}); using defaults", path.display()),
+                }
+                Config::default()
+            }),
+        };
         let b = builtins();
         c.profiles.retain(|k, _| !b.contains_key(k));
         if !c.profile_exists(&c.base) {
@@ -210,6 +225,34 @@ mod tests {
         let d = Config::load(&p);
         assert!(!d.profiles.contains_key("max"));
         assert!(d.profile("max").unwrap().smu.co_all.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_config_is_moved_aside() {
+        let dir = std::env::temp_dir().join(format!("oc-cfg-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let junk = b"{\"version\": 1, \"base\": \"my-oc\", \"profiles\": {\"my-oc\": {\"smu\": {\"co_all\": -1";
+        std::fs::write(&p, junk).unwrap();
+        let c = Config::load(&p);
+        assert_eq!(c.base, "stock", "defaults");
+        assert!(c.profiles.contains_key("custom"), "defaults");
+        assert!(!p.exists(), "the bad file is not left where the next save would overwrite it");
+        let bad: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("config.json.bad-"))
+            .collect();
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        let stamp = bad[0].file_name().to_string_lossy()["config.json.bad-".len()..].to_string();
+        assert!(!stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()), "{stamp}");
+        assert_eq!(std::fs::read(bad[0].path()).unwrap(), junk, "original bytes kept");
+        // A missing config is simply the defaults, nothing moved.
+        let q = dir.join("none.json");
+        assert_eq!(Config::load(&q).base, "stock");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
