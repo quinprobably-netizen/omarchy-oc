@@ -128,6 +128,40 @@ pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     fs::rename(&tmp, path)
 }
 
+/// Open (creating it, mode 0600) a lock file for [`flock_exclusive`].
+pub fn open_lock(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(d) = path.parent() {
+        fs::create_dir_all(d)?;
+    }
+    fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(path)
+}
+
+/// An exclusive flock(2), released when dropped.
+pub struct FlockGuard<'a>(&'a fs::File);
+
+/// Wait for an exclusive flock(2) on `f`. It is held by the open file, so
+/// it excludes other processes and other opens of the same file.
+pub fn flock_exclusive(f: &fs::File) -> io::Result<FlockGuard<'_>> {
+    use std::os::fd::AsRawFd;
+    loop {
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(FlockGuard(f));
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+impl Drop for FlockGuard<'_> {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// Parse a CPU list like "0-3,6,8-9".
 pub fn parse_cpulist(s: &str) -> Vec<u32> {
     let mut v = Vec::new();
@@ -162,6 +196,30 @@ mod tests {
     fn cpulist() {
         assert_eq!(parse_cpulist("0-3,6,8-9"), vec![0, 1, 2, 3, 6, 8, 9]);
         assert_eq!(parse_cpulist(""), Vec::<u32>::new());
+    }
+
+    fn try_lock(f: &fs::File) -> bool {
+        use std::os::fd::AsRawFd;
+        let ok = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if ok {
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        }
+        ok
+    }
+
+    #[test]
+    fn flock_guard_excludes_until_dropped() {
+        let dir = std::env::temp_dir().join(format!("oc-flock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("x.lock");
+        let a = open_lock(&p).unwrap();
+        let b = open_lock(&p).unwrap();
+        {
+            let _g = flock_exclusive(&a).unwrap();
+            assert!(!try_lock(&b), "a second open of the lock file must wait");
+        }
+        assert!(try_lock(&b), "released on drop");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

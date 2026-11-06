@@ -11,7 +11,7 @@
 //! Every value set here is volatile: the SMU forgets it on reboot.
 
 use crate::tune::SmuTune;
-use crate::util::Sys;
+use crate::util::{FlockGuard, Sys, flock_exclusive};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
@@ -76,26 +76,52 @@ pub fn supported(vendor: &str, family: u32, model: u32) -> Option<&'static str> 
     }
 }
 
+/// Serialises SMN index/data access between root processes (the daemon
+/// and a manual `omarchy-ocd restore`). The window is one per machine, so
+/// the lock path is fixed rather than under `--run-dir` (two runs with
+/// different run dirs must still exclude each other); /run/omarchy-oc is
+/// the unit's RuntimeDirectory, writable under ProtectSystem=strict.
+pub const SMN_LOCK: &str = "/run/omarchy-oc/smn.lock";
+
 pub struct Smn {
     cfg: File,
+    lock: File,
 }
 
 impl Smn {
     pub fn open(sys: &Sys) -> std::io::Result<Smn> {
         let p: PathBuf = sys.p("/sys/bus/pci/devices/0000:00:00.0/config");
-        Ok(Smn { cfg: OpenOptions::new().read(true).write(true).open(p)? })
+        let cfg = OpenOptions::new().read(true).write(true).open(p)?;
+        let lock = crate::util::open_lock(&sys.p(SMN_LOCK))?;
+        Ok(Smn { cfg, lock })
     }
 
-    pub fn read(&self, addr: u32) -> std::io::Result<u32> {
+    /// Hold the SMN lock for a whole transaction (use the `_raw` calls
+    /// inside it).
+    fn lock(&self) -> std::io::Result<FlockGuard<'_>> {
+        flock_exclusive(&self.lock)
+    }
+
+    fn read_raw(&self, addr: u32) -> std::io::Result<u32> {
         self.cfg.write_all_at(&addr.to_le_bytes(), NB_ADDR)?;
         let mut b = [0u8; 4];
         self.cfg.read_exact_at(&mut b, NB_DATA)?;
         Ok(u32::from_le_bytes(b))
     }
 
-    pub fn write(&self, addr: u32, val: u32) -> std::io::Result<()> {
+    fn write_raw(&self, addr: u32, val: u32) -> std::io::Result<()> {
         self.cfg.write_all_at(&addr.to_le_bytes(), NB_ADDR)?;
         self.cfg.write_all_at(&val.to_le_bytes(), NB_DATA)
+    }
+
+    pub fn read(&self, addr: u32) -> std::io::Result<u32> {
+        let _g = self.lock()?;
+        self.read_raw(addr)
+    }
+
+    pub fn write(&self, addr: u32, val: u32) -> std::io::Result<()> {
+        let _g = self.lock()?;
+        self.write_raw(addr, val)
     }
 }
 
@@ -310,8 +336,12 @@ impl Smu {
     pub fn open(sys: &Sys, family: &str) -> Result<Smu, String> {
         let smn = Smn::open(sys).map_err(|e| format!("host bridge config space: {e}"))?;
         let smu = Smu { smn, family: family.to_string() };
-        smu.smn.write(MP1.arg, 0x47).map_err(|e| e.to_string())?;
-        if smu.smn.read(MP1.arg).map_err(|e| e.to_string())? != 0x47 {
+        let echo = || -> std::io::Result<u32> {
+            let _g = smu.smn.lock()?;
+            smu.smn.write_raw(MP1.arg, 0x47)?;
+            smu.smn.read_raw(MP1.arg)
+        };
+        if echo().map_err(|e| e.to_string())? != 0x47 {
             return Err("SMN is not writable (kernel lockdown?)".into());
         }
         let (r, _) = smu.send(MP1, 0x1, [0; 6]);
@@ -323,27 +353,29 @@ impl Smu {
 
     fn send(&self, mb: Mailbox, id: u32, args: [u32; 6]) -> (u32, [u32; 6]) {
         let go = || -> std::io::Result<(u32, [u32; 6])> {
+            // One transaction, no other process in between.
+            let _g = self.smn.lock()?;
             // Wait for any earlier message to finish.
             let t0 = Instant::now();
-            while self.smn.read(mb.rsp)? == 0 && t0.elapsed() < Duration::from_millis(100) {
+            while self.smn.read_raw(mb.rsp)? == 0 && t0.elapsed() < Duration::from_millis(100) {
                 std::thread::sleep(Duration::from_micros(200));
             }
-            self.smn.write(mb.rsp, 0)?;
+            self.smn.write_raw(mb.rsp, 0)?;
             for (i, a) in args.iter().enumerate() {
-                self.smn.write(mb.arg + 4 * i as u32, *a)?;
+                self.smn.write_raw(mb.arg + 4 * i as u32, *a)?;
             }
-            self.smn.write(mb.msg, id)?;
+            self.smn.write_raw(mb.msg, id)?;
             let t0 = Instant::now();
             let mut r = 0;
             while r == 0 && t0.elapsed() < Duration::from_millis(500) {
-                r = self.smn.read(mb.rsp)?;
+                r = self.smn.read_raw(mb.rsp)?;
                 if r == 0 {
                     std::thread::sleep(Duration::from_micros(100));
                 }
             }
             let mut out = [0u32; 6];
             for (i, o) in out.iter_mut().enumerate() {
-                *o = self.smn.read(mb.arg + 4 * i as u32)?;
+                *o = self.smn.read_raw(mb.arg + 4 * i as u32)?;
             }
             Ok((r, out))
         };
@@ -424,6 +456,30 @@ mod tests {
         assert_eq!(p.tctl_limit, Some(95.0));
         let q = PmLimits::parse(0x370000, &t);
         assert_eq!(q.stapm_limit, None);
+    }
+
+    #[test]
+    fn smn_access_waits_for_the_lock() {
+        use std::os::fd::AsRawFd;
+        let root = std::env::temp_dir().join(format!("oc-smn-{}", std::process::id()));
+        let cfg = root.join("sys/bus/pci/devices/0000:00:00.0/config");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, vec![0u8; 256]).unwrap();
+        let sys = Sys::new(&root);
+        let smn = Smn::open(&sys).unwrap();
+        // Another process holds the lock: an SMN access must wait for it.
+        let other = crate::util::open_lock(&sys.p(SMN_LOCK)).unwrap();
+        assert_eq!(unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            smn.write(0x1234, 7).unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "wrote while the lock was held");
+        unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_UN) };
+        rx.recv_timeout(Duration::from_secs(5)).expect("goes ahead once the lock is free");
+        t.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

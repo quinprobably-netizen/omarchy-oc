@@ -495,3 +495,33 @@ fn restore_smu_deletes_record_only_when_all_restored() {
     let out = omarchy_oc::daemon::restore_smu(&fake, &p);
     assert!(!p.run("smu-applied.json").exists(), "{out:?}");
 }
+
+// ---- detect is passive: no SMU access at all (I2) ------------------------------
+
+#[test]
+fn passive_never_touches_the_smn_window() {
+    let f = Fake::new("passive-smn");
+    // The fake CPU is a Phoenix-family APU, so a managing daemon would open
+    // the mailbox; give it a config space to scribble on.
+    let cfgp = f.root.join("sys/bus/pci/devices/0000:00:00.0/config");
+    std::fs::create_dir_all(cfgp.parent().unwrap()).unwrap();
+    std::fs::write(&cfgp, vec![0u8; 256]).unwrap();
+    let mut c = Core::passive(omarchy_oc::util::Sys::new(&f.root), f.paths());
+    c.tick();
+    assert_eq!(std::fs::read(&cfgp).unwrap(), vec![0u8; 256], "no SMN index/data access");
+    assert!(!f.root.join("run/omarchy-oc/smn.lock").exists(), "the mailbox was never opened");
+    let st = c.status(1);
+    assert_eq!(st["caps"]["smu"], json!(false));
+    assert!(st["caps"]["smu_error"].as_str().unwrap_or("").contains("read-only"), "{}", st["caps"]);
+    assert!(!f.paths().run("info.json").exists(), "detect leaves the daemon's info.json alone");
+}
+
+#[test]
+fn passive_without_config_space_reports_smu_unavailable() {
+    let f = Fake::new("passive-nocfg");
+    let c = Core::passive(omarchy_oc::util::Sys::new(&f.root), f.paths());
+    let st = c.status(1);
+    assert_eq!(st["caps"]["smu"], json!(false));
+    let e = st["caps"]["smu_error"].as_str().unwrap_or("");
+    assert!(!e.contains("host bridge"), "the config space was not even opened: {e}");
+}

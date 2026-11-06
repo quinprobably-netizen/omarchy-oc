@@ -159,6 +159,8 @@ impl Core {
         let smu_family = crate::smu::supported(&cpu.ident.vendor, cpu.ident.family, cpu.ident.model_id).map(String::from);
         let (smu, smu_error) = match &smu_family {
             None => (None, Some(format!("no SMU support for {} (family {:#x} model {:#x})", cpu.ident.model, cpu.ident.family, cpu.ident.model_id))),
+            // `detect`: no SMU commands at all (opening sends a test message).
+            Some(_) if !manage => (None, Some("not opened in a read-only snapshot".into())),
             Some(f) => match Smu::open(&sys, f) {
                 Ok(s) => (Some(Box::new(s) as Box<dyn SmuIo>), None),
                 Err(e) => (None, Some(e)),
@@ -224,8 +226,9 @@ impl Core {
             events: Vec::new(),
             manage,
         };
-        core.write_info();
         if manage {
+            // Not from `detect`: the CLI reads the daemon's info.json.
+            core.write_info();
             core.startup();
         }
         core
