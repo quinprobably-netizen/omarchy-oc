@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "qqq.oc",
+  "name": "Overclock",
+  "version": "0.1.0",
+  "author": "qqq",
+  "license": "MIT",
+  "description": "Monitor and tune the CPU, GPU, memory, platform and fans through the omarchy-ocd daemon.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Overclock",
+    "description": "Live clocks and temperatures, profiles, automation rules and tuning for CPU, GPU, memory and fans.",
+    "category": "System",
+    "aliases": ["oc", "overclock", "tuning", "profiles"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "barMode": "Temps",
+      "socketPath": "/run/omarchy-oc/control.sock",
+      "favourites": "eco,balanced,max"
+    },
+    "schema": [
+      { "key": "barMode", "type": "enum", "label": "Bar display", "options": ["Temps", "Clocks", "Icon"], "defaultValue": "Temps" },
+      { "key": "socketPath", "type": "string", "label": "Daemon socket", "defaultValue": "/run/omarchy-oc/control.sock", "description": "Control socket of omarchy-ocd." },
+      { "key": "favourites", "type": "string", "label": "Favourite profiles", "defaultValue": "eco,balanced,max", "description": "Comma-separated profiles a right click on the bar widget cycles through." }
+    ]
+  }
+}

@@ -1,0 +1,230 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Commons as Commons
+import qs.Ui
+import "Model.js" as Model
+import "components"
+
+// Overclock: bar widget + panel for the omarchy-ocd tuning daemon.
+//
+// Talks to the daemon over its control socket (Client.qml), never through
+// a CLI. The panel is an icon rail on the left and one page on the right;
+// pages live in pages/ and get this item as `root`.
+//
+//   left click    open the panel, or keep pending settings while they count down
+//   right click   cycle the favourite profiles
+Panel {
+  id: root
+
+  moduleName: "qqq.oc"
+  ipcTarget: "qqq.oc"
+  manageIpc: false
+
+  readonly property string socketPath: String(setting("socketPath", "/run/omarchy-oc/control.sock"))
+  readonly property string barMode: String(setting("barMode", "Temps"))
+  readonly property string favourites: String(setting("favourites", "eco,balanced,max"))
+
+  Commons.Translations { id: catalog; directory: Qt.resolvedUrl("i18n") }
+  readonly property var strings: catalog
+
+  Client { id: oc; path: root.socketPath }
+  property alias client: oc
+
+  readonly property var status: oc.status
+  readonly property bool alive: oc.connected && oc.status !== null
+  readonly property var pending: alive && status.pending ? status.pending : null
+  readonly property string alert: alive && status.alert ? String(status.alert) : ""
+  readonly property string active: alive ? String(status.active) : ""
+  readonly property var stockGpuW: alive && status.gpu ? status.gpu.stock_power_w : null
+
+  // ---- edit plumbing (safe keys live, risky keys staged) --------------------
+
+  property string page: "overview"
+  property int railCursor: 0
+  property bool cursorActive: false
+  property var staged: Model.emptyStaged()
+  property var liveChanges: ({})
+  property string error: ""
+  property var lastReport: null
+
+  readonly property color fg: bar ? bar.barForeground : Commons.Color.foreground
+  readonly property color accent: Commons.Color.accent
+  readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
+  readonly property color dim: Qt.darker(fg, 1.4)
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+
+  function requestDone(ok, r) {
+    root.error = ok ? "" : String(r)
+    if (ok && r && typeof r === "object" && r.report !== undefined) root.lastReport = r.report
+  }
+
+  // Safe keys: coalesce everything changed within 250 ms into one edit.
+  function liveEdit(key, value) {
+    var c = liveChanges
+    c[key] = value
+    liveChanges = c
+    liveTimer.restart()
+  }
+
+  Timer { id: liveTimer; interval: 250; onTriggered: root.flushLive() }
+
+  function flushLive() {
+    var changes = liveChanges
+    liveChanges = {}
+    if (Object.keys(changes).length === 0 || !alive) return
+    oc.request("edit", { profile: active, changes: changes }, requestDone)
+  }
+
+  // Risky keys wait in `staged` until applyStaged() sends them with apply:true.
+  function stageEdit(key, value) {
+    staged = Model.stage(staged, active, key, value)
+  }
+
+  function applyStaged() {
+    if (Model.stagedCount(staged) === 0) return
+    var s = staged
+    oc.request("edit", { profile: s.profile, changes: s.changes, apply: true }, function(ok, r) {
+      if (ok) root.discardStaged()
+      root.requestDone(ok, r)
+    })
+  }
+
+  function discardStaged() { staged = Model.emptyStaged() }
+
+  function keep() { oc.request("confirm", null, requestDone) }
+  function revert() { oc.request("revert", null, requestDone) }
+  function clearAlert() { oc.request("clear-alert", null, requestDone) }
+
+  function applyProfile(name) {
+    if (!name) return
+    oc.request("apply", { profile: String(name) }, requestDone)
+  }
+
+  function showPage(name) {
+    page = String(name)
+    railCursor = Model.pageIndex(page)
+  }
+
+  function moveRail(delta) {
+    var n = Model.PAGES.length
+    railCursor = (railCursor + delta + n) % n
+    page = Model.PAGES[railCursor].key
+  }
+
+  IpcHandler {
+    target: "qqq.oc"
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function page(name: string): void { root.showPage(name); root.open() }
+    function keep(): void { root.keep() }
+    function revert(): void { root.revert() }
+  }
+
+  onOpenedChanged: {
+    if (!opened) return
+    cursorActive = false
+    railCursor = Model.pageIndex(page)
+  }
+
+  // ---- bar ---------------------------------------------------------------
+
+  readonly property bool iconOnly: barMode === "Icon" && pending === null && alive
+  readonly property bool urgentState: !alive || alert !== ""
+
+  implicitWidth: iconOnly ? iconButton.implicitWidth : textButton.implicitWidth
+  implicitHeight: iconOnly ? iconButton.implicitHeight : textButton.implicitHeight
+
+  function barPressed(b) {
+    if (b === Qt.RightButton) root.applyProfile(Model.nextFavourite(root.favourites, root.active))
+    else if (root.pending) root.keep()
+    else root.toggle()
+  }
+
+  WidgetButton {
+    id: textButton
+    anchors.fill: parent
+    visible: !root.iconOnly
+    bar: root.bar
+    text: Model.barLabel(root.status, root.alive, root.barMode)
+    fontSize: Style.font.caption
+    horizontalMargin: 6
+    active: root.urgentState
+    activeColor: root.urgent
+    tooltipText: Model.tooltip(root.status, root.alive)
+    onPressed: function(b) { root.barPressed(b) }
+  }
+
+  BarIconButton {
+    id: iconButton
+    anchors.fill: parent
+    visible: root.iconOnly
+    bar: root.bar
+    text: Model.profileIcon(root.active)
+    active: root.urgentState
+    activeColor: root.urgent
+    tooltipText: Model.tooltip(root.status, root.alive)
+    onPressed: function(b) { root.barPressed(b) }
+  }
+
+  // ---- panel -------------------------------------------------------------
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: root.iconOnly ? iconButton : textButton
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(540))
+    contentHeight: panel.fittedContentHeight(body.implicitHeight)
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      // Arrows walk the rail; Enter keeps pending settings; Tab is the page's.
+      onMoveRequested: function(dx, dy) {
+        root.cursorActive = true
+        root.moveRail(dy !== 0 ? dy : dx)
+      }
+      onActivateRequested: {
+        if (root.pending) root.keep()
+        else if (pageLoader.item && typeof pageLoader.item.activate === "function") pageLoader.item.activate()
+      }
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) {
+        if (pageLoader.item && typeof pageLoader.item.tabRequested === "function") pageLoader.item.tabRequested(direction)
+      }
+
+      Row {
+        id: body
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        spacing: Style.space(12)
+
+        Rail {
+          id: rail
+          pages: Model.PAGES
+          current: root.page
+          cursor: root.cursorActive ? root.railCursor : -1
+          foreground: root.fg
+          accent: root.accent
+          fontFamily: root.fontFamily
+          onSelected: function(name) { root.cursorActive = false; root.showPage(name) }
+        }
+
+        Loader {
+          id: pageLoader
+          width: body.width - rail.width - body.spacing
+          readonly property string src: Model.pageSource(root.page)
+          onSrcChanged: load()
+          Component.onCompleted: load()
+          function load() { setSource(Qt.resolvedUrl(src), { root: root }) }
+        }
+      }
+    }
+  }
+}

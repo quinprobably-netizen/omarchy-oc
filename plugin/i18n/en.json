@@ -1,0 +1,11 @@
+{
+  "page.overview": "Overview",
+  "page.coming": "Coming in a later task",
+  "overview.offline": "Offline",
+  "overview.auto": "auto",
+  "pending.text": "Keep %1? It reverts in %2 s.",
+  "pending.keep": "Keep",
+  "pending.revert": "Revert",
+  "alert.clear": "Clear",
+  "profiles.untested": "Risky and not yet kept through a Keep/Revert window"
+}

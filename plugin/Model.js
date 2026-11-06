@@ -1,0 +1,340 @@
+// Pure helpers for the Overclock panel. No QML types here so
+// tests/model.test.js can load this file under node.
+//
+// Nerd Font glyphs are written as surrogate-pair escapes: raw private-use
+// characters do not survive every editor and QML's JS engine reads \uXXXX
+// pairs everywhere.
+
+var RISKY_PREFIXES = ["smu."]
+var RETRY_MS = 2000
+
+var PROFILE_ICONS = {
+  stock: "󰓦",        // 󰓦
+  eco: "󰌪",          // 󰌪
+  balanced: "󰾅",     // 󰾅
+  performance: "󰓅",  // 󰓅
+  max: "󱐋"           // 󱐋
+}
+var PROFILE_ICON_OTHER = "󰒓"  // 󰒓
+
+var PROFILE_LABELS = { stock: "Stock", eco: "Eco", balanced: "Balanced", performance: "Perf", max: "Max" }
+
+// The rail, top to bottom. `file` is set once a page exists; the rest load
+// pages/Placeholder.qml until their task lands.
+var PAGES = [
+  { key: "overview", icon: "󰕮", label: "Overview", file: "Overview.qml" },  // 󰕮
+  { key: "cpu",      icon: "󰍛", label: "CPU" },                             // 󰍛
+  { key: "gpu",      icon: "󰢮", label: "GPU" },                             // 󰢮
+  { key: "memory",   icon: "󰘚", label: "Memory" },                          // 󰘚
+  { key: "fans",     icon: "󰈐", label: "Fans" },                            // 󰈐
+  { key: "auto",     icon: "󰁪", label: "Auto" },                            // 󰁪
+  { key: "test",     icon: "󰙨", label: "Test" }                             // 󰙨
+]
+
+function pageIndex(key) {
+  for (var i = 0; i < PAGES.length; i++) if (PAGES[i].key === key) return i
+  return 0
+}
+
+function pageSource(key) {
+  var p = PAGES[pageIndex(key)]
+  return "pages/" + (p.file || "Placeholder.qml")
+}
+
+// ---- risk classification (mirrors tune::key_is_risky in the daemon) -------
+
+// null, "", "stock" and "null" clear a key back to stock.
+function clears(value) {
+  if (value === null || value === undefined) return true
+  if (typeof value === "string") {
+    var s = value.trim()
+    return s === "" || s === "stock" || s === "null"
+  }
+  return false
+}
+
+function num(value) {
+  if (typeof value === "number") return isFinite(value) ? value : null
+  if (typeof value === "string") {
+    var s = value.trim()
+    if (s === "") return null
+    var n = Number(s)
+    return isFinite(n) ? n : null
+  }
+  return null
+}
+
+// smu.* is risky except Curve Optimizer at 0 (that is stock); gpu.power_w
+// is risky above stock (or when stock is unknown); clearing is never risky.
+function isRisky(key, value, stockGpuW) {
+  if (clears(value)) return false
+  var parts = String(key).split(".")
+  if (parts[0] === "smu") {
+    if ((parts.length === 2 && parts[1] === "co_all") || (parts.length === 3 && parts[1] === "co_cores")) {
+      return num(value) !== 0
+    }
+    return true
+  }
+  if (parts.length === 2 && parts[0] === "gpu" && parts[1] === "power_w") {
+    var w = num(value), stock = num(stockGpuW)
+    if (w === null || stock === null) return true
+    return w > stock + 0.5
+  }
+  return false
+}
+
+// ---- staging --------------------------------------------------------------
+
+function emptyStaged() {
+  return { profile: "", changes: {} }
+}
+
+// Returns a new staged set with `key` added. Staging for another profile
+// starts over: the stage bar belongs to one profile at a time.
+function stage(staged, profile, key, value) {
+  var out = emptyStaged()
+  out.profile = profile
+  if (staged && staged.profile === profile && staged.changes) {
+    for (var k in staged.changes) out.changes[k] = staged.changes[k]
+  }
+  out.changes[key] = value
+  return out
+}
+
+function stagedCount(staged) {
+  if (!staged || !staged.changes) return 0
+  return Object.keys(staged.changes).length
+}
+
+function splitEdit(changes, stockGpuW) {
+  var out = { safe: {}, risky: {} }
+  if (!changes) return out
+  for (var k in changes) (isRisky(k, changes[k], stockGpuW) ? out.risky : out.safe)[k] = changes[k]
+  return out
+}
+
+// ---- text -----------------------------------------------------------------
+
+// For a sink whose text format the plugin cannot set (bar tooltips): the
+// angle brackets that make Qt treat a string as rich text become their
+// single-angle quotation marks.
+function plain(s) {
+  if (s === null || s === undefined) return ""
+  return String(s).replace(/</g, "‹").replace(/>/g, "›")
+}
+
+function fmt(v, digits, unit) {
+  var n = num(v)
+  if (n === null) return "—"
+  return n.toFixed(digits || 0) + (unit || "")
+}
+
+function ghz(mhz) {
+  var n = num(mhz)
+  return n === null ? "—" : (n / 1000).toFixed(1) + "G"
+}
+
+function gib(mib) {
+  var n = num(mib)
+  return n === null ? "—" : (n / 1024).toFixed(1)
+}
+
+// A core that fails under test gets a Curve Optimizer value 5 closer to 0.
+function suggestCo(v) {
+  var n = num(v)
+  if (n === null) return 0
+  return Math.min(0, n + 5)
+}
+
+function profileIcon(name) {
+  return PROFILE_ICONS[name] || PROFILE_ICON_OTHER
+}
+
+function profileLabel(name) {
+  return PROFILE_LABELS[name] || String(name || "")
+}
+
+// ---- status readers -------------------------------------------------------
+
+function reading(st, block) {
+  return st && st[block] && st[block].reading ? st[block].reading : null
+}
+
+function cpuTemp(st) { var r = reading(st, "cpu"); return r ? r.temp : null }
+function gpuTemp(st) { var r = reading(st, "gpu"); return r ? r.temp : null }
+function cpuMhz(st) { var r = reading(st, "cpu"); return r ? r.mhz_avg : null }
+function gpuMhz(st) { var r = reading(st, "gpu"); return r ? r.act_mhz : null }
+
+function pendingRemaining(st) {
+  return st && st.pending ? Math.max(0, Math.round(Number(st.pending.remaining) || 0)) : -1
+}
+
+function profileEntry(st, name) {
+  if (!st || !st.profiles) return null
+  for (var i = 0; i < st.profiles.length; i++) if (st.profiles[i].name === name) return st.profiles[i]
+  return null
+}
+
+// One chip per profile. A risky profile that has never been kept through
+// its Keep/Revert window is drawn as a warning.
+function profileChips(st) {
+  if (!st || !st.profiles) return []
+  return st.profiles.map(function(p) {
+    return {
+      name: p.name,
+      label: profileLabel(p.name),
+      icon: profileIcon(p.name),
+      on: p.name === st.active,
+      warn: !!p.risky && !p.confirmed,
+      builtin: !!p.builtin
+    }
+  })
+}
+
+function automationLine(st) {
+  if (!st) return ""
+  var rules = st.rules ? st.rules.length : 0
+  var ruleText = rules === 0 ? "no rules" : rules === 1 ? "1 rule" : rules + " rules"
+  var wd = st.watchdog && st.watchdog.enabled ? "watchdog on" : "watchdog off"
+  var head
+  if (st.auto_switch && st.auto_profile) head = "Auto → " + profileLabel(st.auto_profile)
+  else head = (st.auto_switch ? "Auto on" : "Auto off") + " · base " + profileLabel(st.base)
+  return head + " · " + ruleText + " · " + wd
+}
+
+function series(st, name) {
+  var h = st && st.history && st.history.series ? st.history.series[name] : null
+  if (!h) return []
+  return h.map(function(v) { var n = num(v); return n === null ? NaN : n })
+}
+
+function cpuTile(st) {
+  var r = reading(st, "cpu")
+  var cores = st && st.cpu && st.cpu.cores ? st.cpu.cores.length : 0
+  var sub = fmt(r ? r.temp : null, 0, "°")
+  var w = r ? num(r.package_w) : null
+  if (w !== null) {
+    var lim = st.smu && st.smu.limits ? num(st.smu.limits.fast_w) : null
+    sub += " · " + fmt(w, 0, " W") + (lim !== null ? " of " + fmt(lim, 0, " W") : "")
+  }
+  return {
+    title: "CPU" + (cores ? " · " + cores + "c" : ""),
+    value: r && num(r.mhz_avg) !== null ? fmt(r.mhz_avg, 0, " MHz") : "—",
+    sub: sub,
+    seriesName: "cpu_mhz"
+  }
+}
+
+function gpuTile(st) {
+  var g = st ? st.gpu : null
+  var r = g ? g.reading : null
+  var sub = ""
+  if (r) {
+    sub = fmt(r.temp, 0, "°")
+    var w = num(r.power_w)
+    if (w !== null) {
+      var lim = g.knobs ? num(g.knobs.power_w) : null
+      sub += " · " + fmt(w, 0) + (lim !== null ? " of " + fmt(lim, 0) : "") + " W"
+    }
+  }
+  return {
+    title: "GPU" + (g && g.name ? " · " + g.name : ""),
+    value: r && num(r.act_mhz) !== null ? fmt(r.act_mhz, 0, " MHz") : "—",
+    sub: sub,
+    seriesName: "gpu_mhz"
+  }
+}
+
+function memTile(st) {
+  var r = reading(st, "mem")
+  var sub = ""
+  if (r) {
+    sub = gib(r.used_mib) + " / " + gib(r.total_mib) + " GiB"
+    var g = reading(st, "gpu")
+    if (g && num(g.vram_used_mib) !== null) sub += " · VRAM " + gib(g.vram_used_mib) + " GiB"
+  }
+  return {
+    title: "Memory",
+    value: r && num(r.used_pct) !== null ? fmt(r.used_pct, 0, " %") : "—",
+    sub: sub,
+    seriesName: "mem_used_pct"
+  }
+}
+
+function fansTile(st) {
+  var f = st ? st.fans : null
+  var list = f && f.available && f.fans ? f.fans : []
+  var cpu = null, rest = []
+  for (var i = 0; i < list.length; i++) {
+    var x = list[i]
+    if (num(x.rpm) === null) continue
+    if (x.role === "cpu" && cpu === null) cpu = x
+    else rest.push((x.role === "gpu" ? "GPU " : x.role === "case" ? "case " : "") + fmt(x.rpm, 0))
+  }
+  return {
+    title: "Fans" + (f && f.profile ? " · " + profileLabel(f.profile) : ""),
+    value: cpu ? fmt(cpu.rpm, 0, " rpm") : "—",
+    sub: rest.join(" · "),
+    seriesName: "fan_cpu"
+  }
+}
+
+function offlineHint(socketPath) {
+  return "omarchy-ocd is not running (no daemon at " + socketPath + ").\n" +
+    "Start it with:  sudo systemctl enable --now omarchy-ocd"
+}
+
+// ---- bar ------------------------------------------------------------------
+
+function barLabel(st, alive, mode) {
+  if (!st || !alive) return "OC offline"
+  var remaining = pendingRemaining(st)
+  if (remaining >= 0) return "KEEP " + remaining + "s"
+  var icon = profileIcon(st.active)
+  if (mode === "Icon") return icon
+  if (mode === "Clocks") return icon + " " + ghz(cpuMhz(st)) + " · " + ghz(gpuMhz(st))
+  return icon + " " + fmt(cpuTemp(st), 0, "°") + " · " + fmt(gpuTemp(st), 0, "°")
+}
+
+// Shown by the bar's shared tooltip, whose text format the plugin cannot
+// set, so every daemon-supplied string goes through plain().
+function tooltip(st, alive) {
+  if (!st || !alive) return "omarchy-ocd is not running"
+  var lines = []
+  var head = profileLabel(st.active)
+  if (st.auto_switch && st.auto_profile) head += " · auto"
+  var remaining = pendingRemaining(st)
+  if (remaining >= 0) head += " · keep within " + remaining + " s"
+  lines.push(plain(head))
+  var c = reading(st, "cpu")
+  if (c) lines.push("CPU " + fmt(c.mhz_avg, 0, " MHz") + " · " + fmt(c.temp, 0, "°") + (num(c.package_w) !== null ? " · " + fmt(c.package_w, 0, " W") : ""))
+  var g = st.gpu
+  if (g && g.reading) lines.push(plain(g.name || "GPU") + " " + fmt(g.reading.act_mhz, 0, " MHz") + " · " + fmt(g.reading.temp, 0, "°") + " · " + fmt(g.reading.power_w, 0, " W"))
+  if (st.alert) lines.push("Alert: " + plain(st.alert))
+  return lines.join("\n")
+}
+
+function nextFavourite(csv, active) {
+  var names = String(csv || "").split(",").map(function(s) { return s.trim() }).filter(function(s) { return s !== "" })
+  if (names.length === 0) return ""
+  var i = names.indexOf(active)
+  return names[(i + 1) % names.length]
+}
+
+// ---- connection -----------------------------------------------------------
+
+function reconnect(state, nowMs) {
+  return { retryAt: nowMs + RETRY_MS, attempts: (state && state.attempts ? state.attempts : 0) + 1 }
+}
+
+if (typeof module !== "undefined") {
+  module.exports = {
+    RISKY_PREFIXES: RISKY_PREFIXES, RETRY_MS: RETRY_MS, PAGES: PAGES, pageIndex: pageIndex, pageSource: pageSource,
+    clears: clears, num: num, isRisky: isRisky, emptyStaged: emptyStaged, stage: stage, stagedCount: stagedCount,
+    splitEdit: splitEdit, plain: plain, fmt: fmt, ghz: ghz, gib: gib, suggestCo: suggestCo,
+    profileIcon: profileIcon, profileLabel: profileLabel, profileEntry: profileEntry, profileChips: profileChips,
+    automationLine: automationLine, series: series, cpuTile: cpuTile, gpuTile: gpuTile, memTile: memTile,
+    fansTile: fansTile, offlineHint: offlineHint, pendingRemaining: pendingRemaining,
+    barLabel: barLabel, tooltip: tooltip, nextFavourite: nextFavourite, reconnect: reconnect
+  }
+}
