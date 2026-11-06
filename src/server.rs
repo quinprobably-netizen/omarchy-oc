@@ -21,7 +21,7 @@ use std::io::{self, BufRead, BufReader, Read as _, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -31,10 +31,17 @@ pub const MAX_LINE: usize = 256 * 1024;
 pub const MAX_CONNECTIONS: usize = 16;
 /// Samples of history carried by every pushed status.
 pub const PUSH_HISTORY: usize = 120;
+/// Pushed lines a subscriber may leave unread before it is dropped.
+pub const SUB_QUEUE: usize = 8;
+/// Lines queued for one connection's writer before senders block.
+const CONN_QUEUE: usize = 16;
 
-/// Fan-out of pushed lines to every subscribed connection.
+/// Fan-out of pushed lines to every subscribed connection. Each subscriber
+/// has a bounded queue ([`SUB_QUEUE`] lines); one that falls behind is
+/// dropped rather than buffered without limit, so no line is ever skipped
+/// for a live subscriber.
 pub struct Hub {
-    subs: Mutex<Vec<Sender<String>>>,
+    subs: Mutex<Vec<SyncSender<String>>>,
 }
 
 impl Hub {
@@ -43,14 +50,15 @@ impl Hub {
     }
 
     pub fn subscribe(&self) -> Receiver<String> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(SUB_QUEUE);
         unpoison(self.subs.lock()).push(tx);
         rx
     }
 
-    /// Send `line` to every subscriber, dropping those that hung up.
+    /// Send `line` to every subscriber, dropping those that hung up or
+    /// whose queue is full.
     pub fn publish(&self, line: String) {
-        unpoison(self.subs.lock()).retain(|s| s.send(line.clone()).is_ok());
+        unpoison(self.subs.lock()).retain(|s| s.try_send(line.clone()).is_ok());
     }
 }
 
@@ -103,13 +111,15 @@ enum Out {
 struct Conn {
     core: Arc<Mutex<Core>>,
     hub: Arc<Hub>,
-    tx: Sender<Out>,
+    /// Bounded: a client that stops reading blocks its own senders (reader,
+    /// fan and forwarder threads) instead of growing a queue.
+    tx: SyncSender<Out>,
 }
 
 impl Conn {
     fn run(core: Arc<Mutex<Core>>, hub: Arc<Hub>, stream: UnixStream) {
         let Ok(mut w) = stream.try_clone() else { return };
-        let (tx, rx) = mpsc::channel::<Out>();
+        let (tx, rx) = mpsc::sync_channel::<Out>(CONN_QUEUE);
         std::thread::spawn(move || {
             while let Ok(Out::Line(l)) = rx.recv() {
                 if w.write_all(l.as_bytes()).and_then(|_| w.write_all(b"\n")).is_err() {
@@ -178,9 +188,12 @@ impl Conn {
                 std::thread::spawn(move || {
                     while let Ok(l) = rx.recv() {
                         if tx.send(Out::Line(l)).is_err() {
-                            break;
+                            return; // connection gone
                         }
                     }
+                    // The hub dropped us (queue overflowed): close, so the
+                    // client reconnects and gets a fresh status.
+                    let _ = tx.send(Out::Close);
                 });
             }
             _ => {

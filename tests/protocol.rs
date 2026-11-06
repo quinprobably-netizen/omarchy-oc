@@ -130,6 +130,35 @@ fn pending_events_are_pushed() {
 }
 
 #[test]
+fn stalled_subscriber_is_bounded_and_dropped() {
+    // Hub level: a receiver that is never drained holds at most SUB_QUEUE
+    // lines and is then dropped.
+    let hub = Hub::new();
+    let rx = hub.subscribe();
+    for i in 0..1000 {
+        hub.publish(format!("{{\"n\":{i}}}"));
+    }
+    let queued = rx.try_iter().count();
+    assert!(queued <= server::SUB_QUEUE, "queued {queued} lines");
+    assert!(rx.recv().is_err(), "the overflowing subscriber is unsubscribed");
+
+    // Socket level: a client that stops reading is cut off instead of
+    // growing a queue; it gets EOF once it reads what was buffered.
+    let d = Daemon::start("stalled");
+    let mut c = d.connect();
+    c.send(json!({"id": 1, "cmd": "subscribe"}));
+    c.recv_ok();
+    for _ in 0..200 {
+        server::tick_and_publish(&d.core, &d.hub);
+    }
+    let mut got = 0;
+    while c.recv().is_some() {
+        got += 1;
+    }
+    assert!(got < 200, "received {got} of 200 pushed statuses");
+}
+
+#[test]
 fn resubscribe_after_reconnect() {
     let d = Daemon::start("resub");
     {
