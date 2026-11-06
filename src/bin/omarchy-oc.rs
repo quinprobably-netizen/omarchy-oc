@@ -304,7 +304,8 @@ fn begin_tracking(kind: &str, json_out: bool) -> Result<Value, String> {
     if daemon_child() {
         return Err("run by the daemon".into());
     }
-    let tracked = try_call(json!({"cmd": "stress-begin", "kind": kind}));
+    // The pid lets the daemon drop the run if this process dies unseen.
+    let tracked = try_call(json!({"cmd": "stress-begin", "kind": kind, "pid": std::process::id()}));
     if let Err(e) = &tracked
         && !json_out
     {

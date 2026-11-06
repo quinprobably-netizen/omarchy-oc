@@ -553,3 +553,37 @@ fn fork_never_overwrites_an_edited_custom() {
     let res = call(&mut c, json!({"cmd": "edit", "profile": "eco", "changes": {"cpu.epp": "power"}})).unwrap();
     assert_eq!(res["profile"], json!("custom"), "{res}");
 }
+
+// ---- a CLI test killed with -9 does not leave `stress` set (F1) ----------------
+
+#[test]
+fn cli_stress_whose_process_is_gone_is_cleared() {
+    let f = Fake::new("stress-dead-pid");
+    let mut c = f.core();
+    call(&mut c, json!({"cmd": "apply", "profile": "performance"})).unwrap();
+    // No /proc/999999 in the fake tree: that CLI is gone (killed with -9).
+    call(&mut c, json!({"cmd": "stress-begin", "kind": "cpu", "pid": 999999})).unwrap();
+    assert!(f.dir.join("state/dirty").exists());
+    c.tick();
+    let st = c.status(1);
+    assert_eq!(st["stress"], Value::Null, "{}", st["stress"]);
+    assert!(!f.dir.join("state/dirty").exists(), "dirty cleared with it");
+    assert_eq!(profile_status(&c, "performance")["cpu_test"], Value::Null, "no verdict recorded");
+    // A new test can start.
+    call(&mut c, json!({"cmd": "stress-begin", "kind": "cpu", "pid": 999999})).unwrap();
+}
+
+#[test]
+fn cli_stress_whose_process_runs_stays() {
+    let f = Fake::new("stress-live-pid");
+    w(&f.root, "/proc/4242/comm", "omarchy-oc");
+    let mut c = f.core();
+    call(&mut c, json!({"cmd": "stress-begin", "kind": "cpu", "pid": 4242})).unwrap();
+    c.tick();
+    assert_eq!(c.status(1)["stress"]["kind"], json!("cpu"));
+    call(&mut c, json!({"cmd": "stress-end", "kind": "cpu", "passed": true, "errors": 0, "seconds": 60.0})).unwrap();
+    // Without a pid (an older CLI) nothing is cleared behind its back.
+    call(&mut c, json!({"cmd": "stress-begin", "kind": "cpu"})).unwrap();
+    c.tick();
+    assert_eq!(c.status(1)["stress"]["kind"], json!("cpu"));
+}

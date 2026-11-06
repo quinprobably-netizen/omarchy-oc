@@ -75,6 +75,9 @@ struct StressState {
     profile: String,
     /// Requested length, when known (the daemon's own runs).
     seconds: Option<u32>,
+    /// The CLI's process, when it said (`stress-begin` with `pid`): a run
+    /// whose process is gone (killed with -9) is dropped on the next tick.
+    pid: Option<u32>,
 }
 
 pub struct Core {
@@ -592,6 +595,7 @@ impl Core {
             return;
         }
         self.poll_test();
+        self.reap_cli_test();
 
         if let Some(p) = &self.pending {
             if t >= p.deadline {
@@ -839,7 +843,7 @@ impl Core {
     /// A test starts on the active profile: refuse while settings are
     /// pending or another test runs; set the dirty marker so a crash under
     /// test counts against the profile.
-    fn begin_test(&mut self, kind: &str, seconds: Option<u32>) -> Result<Value, String> {
+    fn begin_test(&mut self, kind: &str, seconds: Option<u32>, pid: Option<u32>) -> Result<Value, String> {
         if self.stress.is_some() {
             return Err("a test is already running".into());
         }
@@ -847,7 +851,7 @@ impl Core {
             return Err("confirm or revert the pending settings first".into());
         }
         self.set_dirty(&self.active.clone());
-        self.stress = Some(StressState { kind: kind.to_string(), started: now(), profile: self.active.clone(), seconds });
+        self.stress = Some(StressState { kind: kind.to_string(), started: now(), profile: self.active.clone(), seconds, pid });
         self.health_base = self.health.counts();
         Ok(json!({"profile": self.active}))
     }
@@ -924,6 +928,21 @@ impl Core {
         });
         let r = json!({"passed": passed, "errors": errors, "seconds": fin["t"], "detail": detail, "completed": completed});
         self.finish_test(&kind, r, interrupted);
+    }
+
+    /// A CLI run whose process is gone without `stress-end` (killed with
+    /// -9) says nothing about the profile: drop it, no verdict, and clear
+    /// the dirty marker it set.
+    fn reap_cli_test(&mut self) {
+        let Some(st) = &self.stress else { return };
+        let Some(pid) = st.pid else { return };
+        if self.test.is_some() || self.sys.exists(format!("/proc/{pid}")) {
+            return;
+        }
+        let (kind, profile) = (st.kind.clone(), st.profile.clone());
+        self.stress = None;
+        self.clear_dirty();
+        self.message = format!("The {kind} test on \"{profile}\" ended without a result (its process is gone); not recorded");
     }
 
     /// Record a test's verdict `r` (the `record_test` shape) and push
@@ -1211,7 +1230,8 @@ impl Core {
             }
             "stress-begin" => {
                 let kind = s("kind").unwrap_or("cpu").to_string();
-                self.begin_test(&kind, None)
+                let pid = req.get("pid").and_then(Value::as_u64).and_then(|p| u32::try_from(p).ok());
+                self.begin_test(&kind, None, pid)
             }
             "stress-end" => {
                 let kind = match s("kind") {
@@ -1237,7 +1257,7 @@ impl Core {
                 }
                 let cores = self.cpu.threads.iter().map(|t| t.core).collect::<std::collections::BTreeSet<_>>().len();
                 let run = TestRun::start(&kind, seconds, cores, &self.paths.bin_dir).map_err(|e| format!("cannot start the {kind} test: {e}"))?;
-                let r = self.begin_test(&kind, Some(seconds))?;
+                let r = self.begin_test(&kind, Some(seconds), None)?;
                 self.test = Some(run);
                 self.message = format!("Running the {kind} stability test on \"{}\"", self.active);
                 Ok(json!({"kind": kind, "seconds": seconds, "profile": r["profile"]}))
