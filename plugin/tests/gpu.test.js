@@ -90,6 +90,33 @@ test("clampClock: min never above max, max never below min", () => {
   assert.equal(G.clampClock("max", 2000, null, null), 2000)
 })
 
+test("shownClock: unflushed live batch, then the profile's tune, then the hardware knob", () => {
+  const knobs = status.gpu.knobs
+  assert.equal(G.shownClock("min", null, null, knobs), 600)
+  assert.equal(G.shownClock("min", {}, { min_mhz: 1500, max_mhz: null }, knobs), 1500)
+  assert.equal(G.shownClock("max", {}, { min_mhz: 1500, max_mhz: null }, knobs), 2400)
+  assert.equal(G.shownClock("max", { "gpu.max_mhz": 1800 }, { max_mhz: 2000 }, knobs), 1800)
+  assert.equal(G.shownClock("max", null, null, null), null)
+})
+
+test("clampClockEdit: the pair the daemon sees stays valid", () => {
+  const knobs = status.gpu.knobs
+  // Drag min to 2000, then max to 1800 inside one debounce window: the
+  // min is still in the unflushed batch, so max goes out as 2000.
+  const live = { "gpu.min_mhz": 2000 }
+  assert.equal(G.clampClockEdit("max", 1800, live, null, knobs), 2000)
+  assert.equal(G.clampClockEdit("max", 2200, live, null, knobs), 2200)
+  // The profile says min 1500 while the hardware (failed write) still
+  // reports 600: the max cannot go below the profile's 1500.
+  const tune = { min_mhz: 1500, max_mhz: null }
+  assert.equal(G.clampClockEdit("max", 1000, {}, tune, knobs), 1500)
+  // And the min cannot pass the profile's max of 2000 even though the
+  // hardware reports 2400.
+  assert.equal(G.clampClockEdit("min", 2300, {}, { min_mhz: null, max_mhz: 2000 }, knobs), 2000)
+  // Nothing known about the other side: the value goes through rounded.
+  assert.equal(G.clampClockEdit("min", 700.4, null, null, null), 700)
+})
+
 test("gpuHeadline: vendor, PCIe generation, ReBAR; temp · W on the right", () => {
   const h = G.gpuHeadline(status, info)
   assert.equal(h.caption, "ASRock Arc A580 · PCIe 4.0 ×4 · ReBAR 8 GiB")
@@ -107,6 +134,14 @@ test("chartSeries: the three series with their own scales and latest-value label
   assert.deepEqual(s[0].values, [600, 600, NaN, 2400])
   assert.equal(s[0].color, "#b57bff")
   assert.equal(s[0].label, "2400 MHz")
+  // xe reports act_mhz 0 while the GT sleeps in rc6: a gap, not a drop to 0,
+  // and the legend says so when the latest sample is one.
+  const idle = { history: { series: { gpu_mhz: [600, 0, 600, 0] } } }
+  const si = G.chartSeries(idle, {}, "idle")
+  assert.deepEqual(si[0].values, [600, NaN, 600, NaN])
+  assert.equal(si[0].label, "idle")
+  assert.equal(G.chartSeries(idle, {})[0].label, "idle")
+  assert.equal(G.chartSeries({ history: { series: { gpu_mhz: [0, 600] } } }, {})[0].label, "600 MHz")
   assert.deepEqual([s[0].min, s[0].max], [0, 2400])
   assert.equal(s[1].label, "40 °C")
   assert.deepEqual([s[1].min, s[1].max], [0, 100])

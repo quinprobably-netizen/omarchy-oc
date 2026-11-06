@@ -1,6 +1,7 @@
 import QtQuick
 import qs.Commons
 import qs.Commons as Commons
+import "../lib/chart.js" as ChartLib
 
 // Several series in one box, each line on its own scale so a clock in MHz,
 // a temperature and a power draw can share the chart. A legend swatch per
@@ -8,7 +9,8 @@ import qs.Commons as Commons
 //
 //   series   [{values, color, label, min, max}]: `min`/`max` fix the
 //            series' scale; a missing one falls back to minY/maxY, then to
-//            the data. Gaps (NaN) break the line.
+//            the data (lib/chart.js scaleOf). Gaps (NaN) break the line;
+//            a single sample between gaps is drawn as a dot.
 //   minY     the chart's default scale (null: from the data)
 //   maxY
 Rectangle {
@@ -46,31 +48,6 @@ Rectangle {
       function onMaxYChanged() { canvas.requestPaint() }
     }
 
-    function scaleOf(s) {
-      var lo = finiteOr(s.min, finiteOr(chart.minY, Infinity))
-      var hi = finiteOr(s.max, finiteOr(chart.maxY, -Infinity))
-      var vals = s.values || []
-      if (lo === Infinity || hi === -Infinity) {
-        for (var i = 0; i < vals.length; i++) {
-          var v = Number(vals[i])
-          if (!isFinite(v)) continue
-          if (lo === Infinity && v < lo) lo = v
-          if (hi === -Infinity && v > hi) hi = v
-        }
-        // Only one bound came from the data: re-run against the other.
-        if (lo === Infinity) lo = hi
-        if (hi === -Infinity) hi = lo
-      }
-      if (!isFinite(lo) || !isFinite(hi)) return null
-      if (hi - lo < 1e-9) { lo -= 1; hi += 1 }
-      return { lo: lo, hi: hi }
-    }
-
-    function finiteOr(v, fallback) {
-      var n = Number(v)
-      return v !== null && v !== undefined && v !== "" && isFinite(n) ? n : fallback
-    }
-
     onPaint: {
       var ctx = getContext("2d")
       ctx.reset()
@@ -89,14 +66,13 @@ Rectangle {
       }
 
       var list = canvas.list
-      var n = 0
-      for (var a = 0; a < list.length; a++) n = Math.max(n, (list[a].values || []).length)
+      var n = ChartLib.sampleCount(list)
       if (n < 2) return
 
       for (var si = 0; si < list.length; si++) {
         var s = list[si]
         var vals = s.values || []
-        var sc = scaleOf(s)
+        var sc = ChartLib.scaleOf(s, chart.minY, chart.maxY)
         if (sc === null) continue
         var span = sc.hi - sc.lo
         var color = s.color || fg
@@ -110,7 +86,8 @@ Rectangle {
         ctx.strokeStyle = color
         ctx.lineWidth = si === 0 ? 2 : 1.5
         ctx.lineJoin = "round"
-        if (si === 0) ctx.fillStyle = Qt.rgba(Qt.color(color).r, Qt.color(color).g, Qt.color(color).b, 0.12)
+        var c = Qt.color(color)
+        if (si === 0) ctx.fillStyle = Qt.rgba(c.r, c.g, c.b, 0.12)
 
         var runStart = -1
         for (var j = 0; j <= vals.length; j++) {
@@ -118,7 +95,16 @@ Rectangle {
           if (ok && runStart < 0) runStart = j
           if (!ok && runStart >= 0) {
             var end = j - 1
-            if (end > runStart) {
+            if (end === runStart) {
+              // A lone sample between gaps: a dot, so a line that is
+              // mostly gaps (an idle clock) still shows where it sits.
+              ctx.save()
+              ctx.fillStyle = color
+              ctx.beginPath()
+              ctx.arc(xOf(end), yOf(Number(vals[end])), ctx.lineWidth * 0.8, 0, Math.PI * 2)
+              ctx.fill()
+              ctx.restore()
+            } else {
               if (si === 0) {
                 ctx.beginPath()
                 ctx.moveTo(xOf(runStart), height)
