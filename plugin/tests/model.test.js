@@ -14,7 +14,7 @@ const status = {
     knobs: { epp: "performance" },
     cores: [{ core: 0, tier: "fast", cpu: 0 }, { core: 1, tier: "dense", cpu: 2 }],
   },
-  smu: { limits: { fast_w: 120 }, stock: null, applied: {}, needs_reboot: [] },
+  smu: { limits: { fast_limit: 120 }, stock: null, applied: {}, needs_reboot: [] },
   gpu: {
     name: "Arc A580",
     reading: { act_mhz: 2400, temp: 52.4, power_w: 141.2, vram_used_mib: 7000, busy: 90 },

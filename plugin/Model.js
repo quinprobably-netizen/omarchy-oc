@@ -247,7 +247,7 @@ function cpuTile(st) {
   var sub = fmt(r ? r.temp : null, 0, "°")
   var w = r ? num(r.package_w) : null
   if (w !== null) {
-    var lim = st.smu && st.smu.limits ? num(st.smu.limits.fast_w) : null
+    var lim = st.smu && st.smu.limits ? num(st.smu.limits.fast_limit) : null
     sub += " · " + fmt(w, 0, " W") + (lim !== null ? " of " + fmt(lim, 0, " W") : "")
   }
   return {
