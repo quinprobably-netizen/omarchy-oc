@@ -24,8 +24,8 @@ var PROFILE_LABELS = { stock: "Stock", eco: "Eco", balanced: "Balanced", perform
 var PAGES = [
   { key: "overview", icon: "󰕮", label: "Overview", file: "Overview.qml" },  // 󰕮
   { key: "cpu",      icon: "󰍛", label: "CPU", file: "Cpu.qml" },            // 󰍛
-  { key: "gpu",      icon: "󰢮", label: "GPU" },                             // 󰢮
-  { key: "memory",   icon: "󰘚", label: "Memory" },                          // 󰘚
+  { key: "gpu",      icon: "󰢮", label: "GPU", file: "Gpu.qml" },            // 󰢮
+  { key: "memory",   icon: "󰘚", label: "Memory", file: "Memory.qml" },      // 󰘚
   { key: "fans",     icon: "󰈐", label: "Fans", file: "Fans.qml" },          // 󰈐
   { key: "auto",     icon: "󰁪", label: "Auto", file: "Auto.qml" },          // 󰁪
   { key: "test",     icon: "󰙨", label: "Test" }                             // 󰙨
