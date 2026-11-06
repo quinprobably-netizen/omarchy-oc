@@ -264,6 +264,53 @@ impl Tune {
     }
 }
 
+/// True when a [`Tune::set_key`] value for `key` is clearing it: JSON null,
+/// or the strings "", "stock" and "null" (the same spellings `set_key` takes).
+fn value_clears(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.is_empty() || s == "stock" || s == "null",
+        _ => false,
+    }
+}
+
+/// The string form of a live-edit value for [`Tune::set_key`]: strings as
+/// given, null as "" (clear), numbers and booleans as their JSON text.
+pub fn value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether setting one key makes a profile risky in the sense of
+/// [`Tune::risky`]: any SMU limit or non-zero Curve Optimizer value, or
+/// `gpu.power_w` above stock (or when stock is unknown). Clearing a key is
+/// never risky, and neither is anything else. The panel applies safe
+/// changes live and stages risky ones behind Apply.
+pub fn key_is_risky(key: &str, value: &serde_json::Value, stock_gpu_power_w: Option<f64>) -> bool {
+    if value_clears(value) {
+        return false;
+    }
+    let num = |v: &serde_json::Value| -> Option<f64> {
+        match v {
+            serde_json::Value::Number(n) => n.as_f64(),
+            serde_json::Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        }
+    };
+    match key.split('.').collect::<Vec<_>>().as_slice() {
+        ["smu", "co_all"] | ["smu", "co_cores", _] => num(value) != Some(0.0),
+        ["smu", _] => true,
+        ["gpu", "power_w"] => match (num(value), stock_gpu_power_w) {
+            (Some(w), Some(stock)) => w > stock + 0.5,
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
 /// Built-in profiles, tuned for a 65 W Ryzen 8000G desktop APU with an
 /// Arc A-series card. "stock" is the empty tune.
 pub fn builtins() -> BTreeMap<String, Tune> {
@@ -347,6 +394,51 @@ mod tests {
         assert!(t.set_key("cpu.min_mhz", "6000").is_err() || t.cpu.max_mhz.is_none());
         t.set_key("gpu.power_w", "").unwrap();
         assert_eq!(t.gpu.power_w, None);
+    }
+
+    #[test]
+    fn key_risk_matches_tune_risk() {
+        use serde_json::json;
+        // Each risky key, set on an empty tune, must make Tune::risky true,
+        // and each safe key must leave it false.
+        let stock = Some(150.0);
+        for (k, v) in [
+            ("smu.co_all", json!(-10)),
+            ("smu.co_cores.2", json!(-5)),
+            ("smu.stapm_w", json!(90)),
+            ("smu.fast_w", json!("95")),
+            ("smu.tctl_c", json!(85)),
+            ("smu.edc_a", json!(120)),
+            ("gpu.power_w", json!(151.0)),
+            ("gpu.power_w", json!("200")),
+        ] {
+            let mut t = Tune::default();
+            t.set_key(k, &value_text(&v)).unwrap();
+            assert!(t.risky(stock), "{k}={v} should make the tune risky");
+            assert!(key_is_risky(k, &v, stock), "{k}={v}");
+        }
+        for (k, v) in [
+            ("smu.co_all", json!(0)),
+            ("smu.co_cores.2", json!("0")),
+            ("gpu.power_w", json!(150.0)),
+            ("gpu.power_w", json!(150.4)),
+            ("gpu.power_w", json!(100)),
+            ("gpu.power_w", json!("stock")),
+            ("smu.co_all", json!(null)),
+            ("cpu.epp", json!("power")),
+            ("cpu.boost", json!(false)),
+            ("gpu.max_mhz", json!(2000)),
+            ("platform.aspm", json!("powersave")),
+            ("fans.profile", json!("silent")),
+        ] {
+            let mut t = Tune::default();
+            t.set_key(k, &value_text(&v)).unwrap();
+            assert!(!t.risky(stock), "{k}={v} should leave the tune safe");
+            assert!(!key_is_risky(k, &v, stock), "{k}={v}");
+        }
+        // Unknown stock: any GPU power value is risky, clearing is not.
+        assert!(key_is_risky("gpu.power_w", &json!(100), None));
+        assert!(!key_is_risky("gpu.power_w", &json!(""), None));
     }
 
     #[test]

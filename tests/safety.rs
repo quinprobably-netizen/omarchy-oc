@@ -115,3 +115,75 @@ fn set_rejects_builtin_and_out_of_range() {
     call(&mut c, json!({"cmd": "copy", "from": "max", "to": "my-max"})).unwrap();
     call(&mut c, json!({"cmd": "set", "profile": "my-max", "key": "smu.co_cores.2", "value": "-20"})).unwrap();
 }
+
+// ---- live-edit endpoint ---------------------------------------------------
+
+#[test]
+fn edit_builtin_forks_custom() {
+    let f = Fake::new("edit-fork");
+    let mut c = f.core();
+    call(&mut c, json!({"cmd": "apply", "profile": "balanced"})).unwrap();
+    let res = call(&mut c, json!({"cmd": "edit", "profile": "balanced", "changes": {"cpu.epp": "power"}})).unwrap();
+    assert_eq!(res["profile"], json!("custom"), "{res}");
+    assert_eq!(res["pending"], json!(false), "{res}");
+    assert_eq!(c.active, "custom");
+    assert_eq!(r(&f.root, "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"), "power");
+    let custom = &c.cfg.profiles["custom"];
+    assert_eq!(custom.cpu.epp.as_deref(), Some("power"));
+    assert_eq!(custom.cpu.governor.as_deref(), Some("powersave"), "copied from balanced");
+    // The panel classifies gpu.power_w against this.
+    let st = c.status(1);
+    assert_eq!(st["gpu"]["stock_power_w"], json!(150.0), "{}", st["gpu"]);
+}
+
+#[test]
+fn edit_risky_needs_apply() {
+    let f = Fake::new("edit-risky");
+    let mut c = f.core();
+    call(&mut c, json!({"cmd": "apply", "profile": "balanced"})).unwrap();
+    let err = call(&mut c, json!({"cmd": "edit", "profile": "custom", "changes": {"smu.co_all": "-10"}})).unwrap_err();
+    assert!(err.contains("risky changes need Apply"), "{err}");
+    assert_eq!(c.cfg.profiles["custom"].smu.co_all, None, "nothing saved without Apply");
+    assert_eq!(c.active, "balanced");
+    let res = call(&mut c, json!({"cmd": "edit", "profile": "custom", "changes": {"smu.co_all": "-10"}, "apply": true})).unwrap();
+    assert_eq!(res["profile"], json!("custom"), "{res}");
+    assert_eq!(res["pending"], json!(true), "{res}");
+    assert_eq!(c.active, "custom");
+    assert_eq!(c.cfg.profiles["custom"].smu.co_all, Some(-10));
+    // The Keep/Revert previous is the profile that was active before the edit.
+    call(&mut c, json!({"cmd": "revert"})).unwrap();
+    assert_eq!(c.active, "balanced");
+}
+
+#[test]
+fn edit_targets_named_profile() {
+    let f = Fake::new("edit-named");
+    let mut c = f.core();
+    call(&mut c, json!({"cmd": "apply", "profile": "performance"})).unwrap();
+    let res = call(&mut c, json!({"cmd": "edit", "profile": "custom", "changes": {"gpu.max_mhz": 2000}})).unwrap();
+    assert_eq!(res["profile"], json!("custom"), "{res}");
+    assert_eq!(res["pending"], json!(false), "{res}");
+    assert_eq!(c.active, "performance", "a safe edit of an inactive profile is saved, not applied");
+    assert_eq!(c.cfg.profiles["custom"].gpu.max_mhz, Some(2000));
+    assert_eq!(r(&f.root, "/sys/devices/pci0000:00/0000:00:01.1/0000:03:00.0/tile0/gt0/freq0/max_freq"), "2400");
+    // All or nothing: one bad key in the batch saves none of it.
+    let err = call(&mut c, json!({"cmd": "edit", "profile": "custom", "changes": {"gpu.max_mhz": 2100, "gpu.bogus": 1}})).unwrap_err();
+    assert!(err.contains("gpu.bogus"), "{err}");
+    assert_eq!(c.cfg.profiles["custom"].gpu.max_mhz, Some(2000));
+}
+
+#[test]
+fn gpu_power_risk_is_relative_to_stock() {
+    use omarchy_oc::tune::key_is_risky;
+    assert!(!key_is_risky("gpu.power_w", &json!(140.0), Some(150.0)));
+    assert!(key_is_risky("gpu.power_w", &json!(160.0), Some(150.0)));
+    assert!(key_is_risky("gpu.power_w", &json!("160"), Some(150.0)), "string values count too");
+    assert!(key_is_risky("gpu.power_w", &json!(100.0), None), "unknown stock is risky");
+    assert!(!key_is_risky("gpu.power_w", &json!("stock"), None), "clearing is never risky");
+    assert!(key_is_risky("smu.co_all", &json!("-10"), Some(150.0)));
+    assert!(key_is_risky("smu.stapm_w", &json!(90), Some(150.0)));
+    assert!(key_is_risky("smu.co_cores.3", &json!(-5), Some(150.0)));
+    assert!(!key_is_risky("smu.co_all", &json!(null), Some(150.0)));
+    assert!(!key_is_risky("cpu.epp", &json!("power"), Some(150.0)));
+    assert!(!key_is_risky("gpu.max_mhz", &json!(2000), Some(150.0)));
+}

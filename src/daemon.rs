@@ -20,7 +20,7 @@ use crate::history::{History, SERIES};
 use crate::mem::Mem;
 use crate::platform::Platform;
 use crate::smu::{PmLimits, Smu};
-use crate::tune::{SmuTune, Tune};
+use crate::tune::{SmuTune, Tune, key_is_risky, value_text};
 use crate::util::{Sys, now, round1, write_atomic};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -226,6 +226,12 @@ impl Core {
 
     fn risky(&self, t: &Tune) -> bool {
         t.risky(self.stock_gpu_w())
+    }
+
+    /// The keys of a live-edit batch that need Apply (see `key_is_risky`).
+    fn risky_keys(&self, changes: &serde_json::Map<String, Value>) -> Vec<String> {
+        let stock = self.stock_gpu_w();
+        changes.iter().filter(|(k, v)| key_is_risky(k, v, stock)).map(|(k, _)| k.clone()).collect()
     }
 
     fn save_cfg(&self) {
@@ -700,7 +706,8 @@ impl Core {
             "cpu": {"model": self.cpu.ident.model, "reading": self.cpu.reading, "knobs": self.cpu.knobs(),
                     "cores": self.cpu.threads.iter().filter(|t| t.cpu == *self.cpu.threads.iter().filter(|u| u.core == t.core).map(|u| &u.cpu).min().unwrap_or(&t.cpu)).map(|t| json!({"core": t.core, "tier": t.tier, "cpu": t.cpu})).collect::<Vec<_>>()},
             "smu": {"limits": self.pm, "stock": self.smu_stock, "applied": self.smu_applied, "needs_reboot": self.needs_reboot},
-            "gpu": self.gpu.as_ref().map(|g| json!({"name": g.ident["name"], "reading": g.reading, "knobs": g.knobs(), "procs": g.procs})),
+            "gpu": self.gpu.as_ref().map(|g| json!({"name": g.ident["name"], "reading": g.reading, "knobs": g.knobs(), "procs": g.procs,
+                                                   "stock_power_w": self.stock_gpu_w()})),
             "mem": {"reading": self.mem.reading()},
             "platform": {"reading": self.platform.reading, "knobs": self.platform.knobs()},
             "fans": self.fans.summary(),
@@ -780,6 +787,36 @@ impl Core {
                 self.cfg.profiles.insert(p.clone(), t);
                 self.save_cfg();
                 self.reapply_if_active(&p)
+            }
+            "edit" => {
+                // The panel's live edit: a batch of dotted keys. Safe changes
+                // apply at once when the profile is active; risky ones need
+                // "apply": true and open the Keep/Revert window. Editing a
+                // built-in forks it into "custom", which then becomes active.
+                let p = name_arg("profile")?;
+                let changes = req.get("changes").and_then(Value::as_object).ok_or("missing \"changes\"")?;
+                let apply = b("apply").unwrap_or(false);
+                let mut t = self.cfg.profile(&p).ok_or_else(|| format!("no profile named \"{p}\""))?;
+                // All or nothing: the whole batch is validated on a copy first.
+                for (k, v) in changes {
+                    t.set_key(k, &value_text(v))?;
+                }
+                let risky = self.risky_keys(changes);
+                if !risky.is_empty() && !apply {
+                    return Err(format!("risky changes need Apply: {}", risky.join(", ")));
+                }
+                let forked = Config::is_builtin(&p);
+                let target = if forked { "custom".to_string() } else { p };
+                self.cfg.profiles.insert(target.clone(), t);
+                self.save_cfg();
+                if forked || !risky.is_empty() || self.active == target {
+                    self.apply_profile(&target, Origin::User)
+                } else {
+                    Ok(json!({
+                        "profile": target, "pending": false, "applied": false,
+                        "report": {"changed": [], "errors": [], "notes": [format!("saved; \"{target}\" is not active")]},
+                    }))
+                }
             }
             "save" => {
                 let p = name_arg("profile")?;
