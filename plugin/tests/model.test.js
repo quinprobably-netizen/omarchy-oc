@@ -232,3 +232,26 @@ test("pages", () => {
   assert.equal(M.pageSource("overview"), "pages/Overview.qml")
   assert.equal(M.pageSource("cpu"), "pages/Placeholder.qml")
 })
+
+test("takeLive holds a live batch until there is a profile to send it to", () => {
+  const changes = { "cpu.epp": "power", "gpu.max_mhz": 2000 }
+  assert.deepEqual(M.takeLive(changes, "stock"), { send: changes, keep: {}, profile: "stock" })
+  assert.deepEqual(M.takeLive(changes, ""), { send: null, keep: changes, profile: "" }, "offline: hold")
+  assert.deepEqual(M.takeLive(changes, null), { send: null, keep: changes, profile: "" }, "no status yet: hold")
+  assert.deepEqual(M.takeLive({}, "stock"), { send: null, keep: {}, profile: "stock" }, "nothing to send")
+  assert.deepEqual(M.takeLive(null, "stock"), { send: null, keep: {}, profile: "stock" })
+})
+
+test("activeProfile reads the live status, empty when there is none", () => {
+  assert.equal(M.activeProfile(status), "performance")
+  assert.equal(M.activeProfile(null), "")
+  assert.equal(M.activeProfile({ ...status, active: null }), "")
+})
+
+test("requestError ignores success and the disconnect sentinel", () => {
+  assert.equal(M.DISCONNECTED, "disconnected")
+  assert.equal(M.requestError(true, { profile: "custom" }), "")
+  assert.equal(M.requestError(false, M.DISCONNECTED), "")
+  assert.equal(M.requestError(false, "risky changes need Apply: smu.co_all"), "risky changes need Apply: smu.co_all")
+  assert.equal(M.requestError(false, null), "request failed")
+})

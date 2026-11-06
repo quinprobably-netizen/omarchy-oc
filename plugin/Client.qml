@@ -14,9 +14,8 @@ QtObject {
 
   property string path: ""
   readonly property bool connected: socket.connected
-  // Latest {"event":"status",...} line, kept across a disconnect so the
-  // panel can still show the last known profile; `connected` says whether
-  // it is current.
+  // Latest {"event":"status",...} line of the current connection; null
+  // while disconnected, so a non-null status is always fresh.
   property var status: null
   property var lastEvent: null
   property string lastError: ""
@@ -79,9 +78,10 @@ QtObject {
   // In-flight requests will never be answered: fail them now. Lines that
   // never left the queue stay for the next connection.
   function onDisconnected() {
+    status = null
     var cbs = callbacks
     callbacks = {}
-    for (var id in cbs) cbs[id](false, "disconnected")
+    for (var id in cbs) cbs[id](false, Model.DISCONNECTED)
   }
 
   function connect() {

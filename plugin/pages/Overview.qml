@@ -11,6 +11,8 @@ Column {
   id: page
 
   required property var root
+  // Every dereference guards on `st` itself, not on `alive`: the two are
+  // not re-evaluated in a fixed order on disconnect (see Panel.qml).
   readonly property var st: root.status
   readonly property bool alive: root.alive
   readonly property var strings: root.strings
@@ -52,7 +54,7 @@ Column {
         textFormat: Text.PlainText
         width: parent.width
         elide: Text.ElideRight
-        text: (page.alive
+        text: (page.st
           ? Model.profileLabel(page.st.active) + (page.st.auto_switch && page.st.auto_profile ? " · " + page.strings.t("overview.auto") : "")
           : page.strings.t("overview.offline")).toUpperCase()
         color: page.dim
@@ -66,7 +68,7 @@ Column {
     Text {
       id: headTemp
       textFormat: Text.PlainText
-      text: page.alive ? Model.fmt(Model.cpuTemp(page.st), 0, "°") : "—"
+      text: page.st ? Model.fmt(Model.cpuTemp(page.st), 0, "°") : "—"
       color: page.fg
       font.family: page.fontFamily
       font.pixelSize: Style.font.displayLarge
@@ -200,7 +202,7 @@ Column {
       anchors.left: parent.left
       anchors.leftMargin: Style.space(10)
       anchors.verticalCenter: parent.verticalCenter
-      color: page.alive && page.st.auto_switch ? page.accent : page.dim
+      color: page.st && page.st.auto_switch ? page.accent : page.dim
     }
     Text {
       id: autoText
@@ -279,7 +281,7 @@ Column {
   }
 
   Text {
-    readonly property string msg: page.root.error !== "" ? page.root.error : (page.alive ? String(page.st.message || "") : "")
+    readonly property string msg: page.root.error !== "" ? page.root.error : (page.st ? String(page.st.message || "") : "")
     visible: msg !== ""
     width: parent.width
     wrapMode: Text.Wrap

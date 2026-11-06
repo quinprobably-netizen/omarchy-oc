@@ -32,12 +32,16 @@ Panel {
   Client { id: oc; path: root.socketPath }
   property alias client: oc
 
+  // A non-null status is always from the live connection (the client drops
+  // it on disconnect). Derived values guard on `status` itself, never on
+  // `alive`: two bindings on the same change are not updated in a fixed
+  // order, so `alive` can still read true while `status` is already null.
   readonly property var status: oc.status
   readonly property bool alive: oc.connected && oc.status !== null
-  readonly property var pending: alive && status.pending ? status.pending : null
-  readonly property string alert: alive && status.alert ? String(status.alert) : ""
-  readonly property string active: alive ? String(status.active) : ""
-  readonly property var stockGpuW: alive && status.gpu ? status.gpu.stock_power_w : null
+  readonly property var pending: status && status.pending ? status.pending : null
+  readonly property string alert: status && status.alert ? String(status.alert) : ""
+  readonly property string active: Model.activeProfile(status)
+  readonly property var stockGpuW: status && status.gpu ? status.gpu.stock_power_w : null
 
   // ---- edit plumbing (safe keys live, risky keys staged) --------------------
 
@@ -55,8 +59,10 @@ Panel {
   readonly property color dim: Qt.darker(fg, 1.4)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
+  // A dropped connection fails in-flight requests with Model.DISCONNECTED;
+  // the offline hint covers that, so it never becomes an error line.
   function requestDone(ok, r) {
-    root.error = ok ? "" : String(r)
+    root.error = Model.requestError(ok, r)
     if (ok && r && typeof r === "object" && r.report !== undefined) root.lastReport = r.report
   }
 
@@ -70,11 +76,22 @@ Panel {
 
   Timer { id: liveTimer; interval: 250; onTriggered: root.flushLive() }
 
+  // Sends the batch against the profile in the client's current status, or
+  // holds it while the daemon is away; onAliveChanged releases it once the
+  // first status of the new connection is in. The profile is read from
+  // oc.status directly: the derived `active` binding may not have been
+  // re-evaluated yet when onAliveChanged runs.
   function flushLive() {
-    var changes = liveChanges
-    liveChanges = {}
-    if (Object.keys(changes).length === 0 || !alive) return
-    oc.request("edit", { profile: active, changes: changes }, requestDone)
+    var t = Model.takeLive(liveChanges, Model.activeProfile(oc.status))
+    liveChanges = t.keep
+    if (t.send === null) return
+    oc.request("edit", { profile: t.profile, changes: t.send }, requestDone)
+  }
+
+  onAliveChanged: {
+    if (!alive) return
+    root.error = ""
+    flushLive()
   }
 
   // Risky keys wait in `staged` until applyStaged() sends them with apply:true.
@@ -121,6 +138,8 @@ Panel {
     function page(name: string): void { root.showPage(name); root.open() }
     function keep(): void { root.keep() }
     function revert(): void { root.revert() }
+    // A safe live edit from a script: omarchy-shell qqq.oc live cpu.epp power
+    function live(key: string, value: string): void { root.liveEdit(key, value) }
   }
 
   onOpenedChanged: {

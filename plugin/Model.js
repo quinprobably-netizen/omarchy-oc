@@ -321,7 +321,33 @@ function nextFavourite(csv, active) {
   return names[(i + 1) % names.length]
 }
 
+// The profile a live edit goes to: the active one in a fresh status.
+function activeProfile(st) {
+  return st && st.active ? String(st.active) : ""
+}
+
+// A live batch goes out only once there is a profile to send it to (a
+// fresh status from a live daemon); otherwise it is held, so a slider move
+// during a daemon restart lands once the daemon is back.
+function takeLive(changes, profile) {
+  var p = profile ? String(profile) : ""
+  var has = !!changes && Object.keys(changes).length > 0
+  if (has && p !== "") return { send: changes, keep: {}, profile: p }
+  return { send: null, keep: has ? changes : {}, profile: p }
+}
+
 // ---- connection -----------------------------------------------------------
+
+// What a callback gets as its error when the connection drops under an
+// in-flight request. The offline hint already says it, so it is not an error
+// to show.
+var DISCONNECTED = "disconnected"
+
+function requestError(ok, r) {
+  if (ok) return ""
+  if (r === DISCONNECTED) return ""
+  return r === null || r === undefined || r === "" ? "request failed" : String(r)
+}
 
 function reconnect(state, nowMs) {
   return { retryAt: nowMs + RETRY_MS, attempts: (state && state.attempts ? state.attempts : 0) + 1 }
@@ -335,6 +361,7 @@ if (typeof module !== "undefined") {
     profileIcon: profileIcon, profileLabel: profileLabel, profileEntry: profileEntry, profileChips: profileChips,
     automationLine: automationLine, series: series, cpuTile: cpuTile, gpuTile: gpuTile, memTile: memTile,
     fansTile: fansTile, offlineHint: offlineHint, pendingRemaining: pendingRemaining,
-    barLabel: barLabel, tooltip: tooltip, nextFavourite: nextFavourite, reconnect: reconnect
+    barLabel: barLabel, tooltip: tooltip, nextFavourite: nextFavourite, reconnect: reconnect,
+    takeLive: takeLive, activeProfile: activeProfile, DISCONNECTED: DISCONNECTED, requestError: requestError
   }
 }
