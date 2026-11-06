@@ -31,5 +31,19 @@
   "cpu.co.all": "All cores",
   "cpu.co.core": "Core %1",
   "core.pass": "passed the last CPU test",
-  "core.fail": "failed the last CPU test"
+  "core.fail": "failed the last CPU test",
+  "page.fans": "Fans",
+  "fans.offline": "omarchy-fand is not running. Start it with:\n  sudo systemctl enable --now omarchy-fand",
+  "fans.profile": "Profile",
+  "fans.none": "No controllable fans found. Is the it87 module loaded?",
+  "fans.curve": "Curve",
+  "fans.curve.hint.fork": "Drag a point to make a Custom profile from %1. Double-click adds, right-click removes.",
+  "fans.curve.hint": "Drag points to edit. Double-click adds a point, right-click removes one.",
+  "fans.calibrate": "Calibrate fans",
+  "fans.calibrate.confirm": "Fans stop briefly — click again",
+  "fans.calibrate.tip": "Measures each fan's stop, start and RPM response (~2 min) so curves are quiet and RPM-accurate",
+  "fans.retest": "Re-test",
+  "fans.retest.tip": "Check whether this fan follows PWM now (~15 s; the fan briefly stops if it does). If it responds it is calibrated (~2 min) and put on its curve.",
+  "fans.bios": "BIOS fan control",
+  "fans.bios.tip": "Let the motherboard's own fan curve run the fans; off takes control back with the selected profile"
 }
