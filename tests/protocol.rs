@@ -222,3 +222,244 @@ fn oversize_line_rejected() {
     let v = c2.recv_ok();
     assert_eq!(v["id"], json!(3));
 }
+
+// ---- stability tests run by the daemon -------------------------------------
+
+/// A tester that prints `lines` (one JSON object each) and exits with `code`.
+/// Its arguments and `$OMARCHY_OC_CHILD` land in files the test can read.
+fn script_lines(lines: &[&str], code: i32) -> String {
+    let mut s = String::from("echo \"$@\" > \"$OUT/args\"\necho \"${OMARCHY_OC_CHILD:-unset}\" > \"$OUT/child\"\n");
+    for l in lines {
+        s.push_str(&format!("echo '{l}'\n"));
+    }
+    s.push_str(&format!("exit {code}\n"));
+    s
+}
+
+/// A tester that waits for SIGINT, then prints its done line and exits 0.
+const SCRIPT_WAITS: &str = "trap 'kill $SLP 2>/dev/null; echo \"{\\\"t\\\":1,\\\"done\\\":true,\\\"passed\\\":true,\\\"errors\\\":0,\\\"interrupted\\\":true,\\\"message\\\":\\\"stopped before the end\\\"}\"; exit 0' INT TERM
+echo '{\"t\":0,\"phase\":\"all cores\",\"blocks\":1,\"errors\":0}'
+sleep 30 >/dev/null 2>&1 & SLP=$!
+wait $SLP
+";
+
+impl Daemon {
+    /// Tick until an event named `name` is pushed to `c`, collecting every
+    /// non-status event seen on the way (in order, `name` last).
+    fn events_until(&self, c: &mut Conn, name: &str, timeout: Duration) -> Vec<Value> {
+        let deadline = Instant::now() + timeout;
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            // Each tick pushes its events, then exactly one status: read
+            // through the status so no push is left for the next reply.
+            server::tick_and_publish(&self.core, &self.hub);
+            let mut hit = false;
+            loop {
+                let ev = c.recv().expect("push before EOF");
+                if ev["event"] == json!("status") {
+                    break;
+                }
+                hit |= ev["event"] == json!(name);
+                seen.push(ev);
+            }
+            if hit {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no {name} event within {timeout:?}; saw {seen:?}");
+    }
+
+    fn profile(&self, name: &str) -> Value {
+        let st = self.core.lock().unwrap().status(1);
+        st["profiles"].as_array().unwrap().iter().find(|p| p["name"] == name).unwrap().clone()
+    }
+
+    fn dirty(&self) -> bool {
+        self.fake.dir.join("state/dirty").exists()
+    }
+}
+
+fn subscribe(c: &mut Conn) {
+    c.send(json!({"id": 1, "cmd": "subscribe"}));
+    c.recv_ok();
+    assert_eq!(c.recv().unwrap()["event"], json!("status"));
+}
+
+#[test]
+fn test_runs_and_records() {
+    let d = Daemon::start("test-run");
+    d.fake.tester(
+        "omarchy-oc",
+        &script_lines(
+            &[
+                r#"{"t":1,"phase":"all cores","blocks":10,"errors":0,"done":false}"#,
+                r#"{"t":2,"phase":"all cores","blocks":20,"errors":0,"done":false}"#,
+                r#"{"t":2.5,"phase":"all cores","blocks":25,"errors":0,"done":true,"passed":true,"isa":"Avx2"}"#,
+            ],
+            0,
+        ),
+    );
+    let mut c = d.connect();
+    subscribe(&mut c);
+    c.send(json!({"id": 2, "cmd": "test-start", "kind": "cpu", "seconds": 5}));
+    let r = c.recv_ok();
+    assert_eq!(r["result"]["profile"], json!("stock"), "{r}");
+    assert!(d.dirty(), "the crash-guard marker is set while a test runs");
+    let st = d.core.lock().unwrap().status(1);
+    assert_eq!(st["stress"]["kind"], json!("cpu"), "{}", st["stress"]);
+    assert_eq!(st["stress"]["profile"], json!("stock"));
+
+    let evs = d.events_until(&mut c, "test-done", Duration::from_secs(10));
+    assert_eq!(evs.len(), 3, "{evs:?}");
+    assert_eq!(evs[0]["event"], json!("test-progress"));
+    assert_eq!(evs[0]["kind"], json!("cpu"));
+    assert_eq!(evs[0]["blocks"], json!(10));
+    assert_eq!(evs[1]["event"], json!("test-progress"));
+    assert_eq!(evs[1]["blocks"], json!(20));
+    let done = &evs[2];
+    assert_eq!(done["kind"], json!("cpu"));
+    assert_eq!(done["passed"], json!(true));
+    assert_eq!(done["errors"], json!(0));
+    assert_eq!(done["profile"], json!("stock"));
+
+    let p = d.profile("stock");
+    assert_eq!(p["cpu_test"]["passed"], json!(true), "{p}");
+    assert_eq!(p["cpu_test"]["errors"], json!(0));
+    let st = d.core.lock().unwrap().status(1);
+    assert_eq!(st["stress"], Value::Null);
+    assert!(!d.dirty(), "the marker is gone after test-done");
+    // The child command and environment.
+    assert_eq!(std::fs::read_to_string(d.fake.dir.join("args")).unwrap().trim(), "stress cpu --json --seconds 5");
+    assert_eq!(std::fs::read_to_string(d.fake.dir.join("child")).unwrap().trim(), "1");
+}
+
+#[test]
+fn test_failure_recorded() {
+    let d = Daemon::start("test-fail");
+    d.fake.tester(
+        "omarchy-oc",
+        &script_lines(&[r#"{"t":3,"phase":"all cores","blocks":9,"errors":3,"done":true,"passed":false,"message":"computation errors on core 1"}"#], 1),
+    );
+    let mut c = d.connect();
+    subscribe(&mut c);
+    c.send(json!({"id": 2, "cmd": "test-start", "kind": "cpu", "seconds": 5}));
+    c.recv_ok();
+    let evs = d.events_until(&mut c, "test-done", Duration::from_secs(10));
+    let done = evs.last().unwrap();
+    assert_eq!(done["passed"], json!(false), "{done}");
+    assert_eq!(done["errors"], json!(3));
+    let p = d.profile("stock");
+    assert_eq!(p["cpu_test"]["passed"], json!(false), "{p}");
+    assert_eq!(p["cpu_test"]["errors"], json!(3));
+    assert!(p["cpu_test"]["detail"].as_str().unwrap().contains("core 1"), "{p}");
+    assert!(!d.dirty());
+}
+
+#[test]
+fn test_exit_without_done_is_failure() {
+    let d = Daemon::start("test-nodone");
+    d.fake.tester("omarchy-oc", &script_lines(&[r#"{"t":1,"phase":"reference","blocks":0,"errors":0,"done":false}"#], 2));
+    let mut c = d.connect();
+    subscribe(&mut c);
+    c.send(json!({"id": 2, "cmd": "test-start", "kind": "cpu", "seconds": 5}));
+    c.recv_ok();
+    let evs = d.events_until(&mut c, "test-done", Duration::from_secs(10));
+    let done = evs.last().unwrap();
+    assert_eq!(done["passed"], json!(false), "{done}");
+    let p = d.profile("stock");
+    assert_eq!(p["cpu_test"]["passed"], json!(false), "{p}");
+    assert_eq!(p["cpu_test"]["detail"], json!("tester exited with code 2"), "{p}");
+    assert!(!d.dirty());
+}
+
+#[test]
+fn test_start_refused_when_pending_or_running() {
+    let d = Daemon::start("test-refuse");
+    d.fake.tester("omarchy-oc", SCRIPT_WAITS);
+    let mut c = d.connect();
+    subscribe(&mut c);
+    c.send(json!({"id": 2, "cmd": "test-start", "kind": "cpu", "seconds": 5}));
+    c.recv_ok();
+    c.send(json!({"id": 3, "cmd": "test-start", "kind": "cpu", "seconds": 5}));
+    let r = c.recv().unwrap();
+    assert_eq!(r["ok"], json!(false), "{r}");
+    assert!(r["error"].as_str().unwrap().contains("already running"), "{r}");
+    c.send(json!({"id": 4, "cmd": "test-stop"}));
+    c.recv_ok();
+    d.events_until(&mut c, "test-done", Duration::from_secs(10));
+    c.send(json!({"id": 5, "cmd": "test-stop"}));
+    let r = c.recv().unwrap();
+    assert_eq!(r["ok"], json!(false), "{r}");
+    assert_eq!(r["error"], json!("no test running"));
+
+    c.send(json!({"id": 6, "cmd": "apply", "profile": "max"}));
+    assert_eq!(c.recv_ok()["result"]["pending"], json!(true));
+    c.send(json!({"id": 7, "cmd": "test-start", "kind": "cpu", "seconds": 5}));
+    let r = c.recv().unwrap();
+    assert_eq!(r["ok"], json!(false), "{r}");
+    assert!(r["error"].as_str().unwrap().contains("confirm or revert"), "{r}");
+    c.send(json!({"id": 8, "cmd": "revert"}));
+    c.recv_ok();
+}
+
+#[test]
+fn test_stop_interrupts() {
+    let d = Daemon::start("test-stop");
+    d.fake.tester("omarchy-oc", SCRIPT_WAITS);
+    let mut c = d.connect();
+    subscribe(&mut c);
+    c.send(json!({"id": 2, "cmd": "test-start", "kind": "cpu", "seconds": 60}));
+    c.recv_ok();
+    assert!(d.dirty());
+    // Let the child reach its wait before interrupting it.
+    let evs = d.events_until(&mut c, "test-progress", Duration::from_secs(10));
+    assert_eq!(evs.len(), 1, "{evs:?}");
+    c.send(json!({"id": 3, "cmd": "test-stop"}));
+    c.recv_ok();
+    let t0 = Instant::now();
+    let evs = d.events_until(&mut c, "test-done", Duration::from_secs(10));
+    assert!(t0.elapsed() < Duration::from_secs(2), "test-done took {:?}", t0.elapsed());
+    let done = evs.last().unwrap();
+    assert_eq!(done["kind"], json!("cpu"), "{done}");
+    assert_eq!(done["interrupted"], json!(true), "{done}");
+    // An interrupted run is not a verdict: nothing recorded, marker gone.
+    let p = d.profile("stock");
+    assert_eq!(p["cpu_test"], Value::Null, "{p}");
+    assert!(!d.dirty());
+    assert_eq!(d.core.lock().unwrap().status(1)["stress"], Value::Null);
+}
+
+#[test]
+fn test_gpu_and_per_core_commands() {
+    let d = Daemon::start("test-cmds");
+    d.fake.tester(
+        "omarchy-oc-gpustress",
+        &script_lines(&[r#"{"t":7,"mode":"mixed","iterations":100,"errors":0,"gflops":1000,"vram_gbps":300,"adapter":"fake","done":true,"passed":true,"interrupted":false}"#], 0),
+    );
+    d.fake.tester("omarchy-oc", &script_lines(&[r#"{"t":30,"phase":"core 1","blocks":5,"errors":0,"done":true,"passed":true}"#], 0));
+    let mut c = d.connect();
+    subscribe(&mut c);
+    c.send(json!({"id": 2, "cmd": "test-start", "kind": "gpu", "seconds": 7}));
+    c.recv_ok();
+    let done = d.events_until(&mut c, "test-done", Duration::from_secs(10)).pop().unwrap();
+    assert_eq!(done["kind"], json!("gpu"), "{done}");
+    assert_eq!(done["passed"], json!(true));
+    assert_eq!(std::fs::read_to_string(d.fake.dir.join("args")).unwrap().trim(), "--json --seconds 7");
+    let p = d.profile("stock");
+    assert_eq!(p["gpu_test"]["passed"], json!(true), "{p}");
+    assert_eq!(p["cpu_test"], Value::Null);
+
+    // Two cores in the fake tree: 30 s / 2 = 15 s per core; never below 10.
+    c.send(json!({"id": 3, "cmd": "test-start", "kind": "cpu-per-core", "seconds": 30}));
+    c.recv_ok();
+    let done = d.events_until(&mut c, "test-done", Duration::from_secs(10)).pop().unwrap();
+    assert_eq!(done["kind"], json!("cpu-per-core"), "{done}");
+    assert_eq!(std::fs::read_to_string(d.fake.dir.join("args")).unwrap().trim(), "stress cpu --json --seconds 30 --per-core --core-seconds 15");
+    let p = d.profile("stock");
+    assert_eq!(p["cpu_test"]["passed"], json!(true), "{p}");
+
+    c.send(json!({"id": 4, "cmd": "test-start", "kind": "disk", "seconds": 30}));
+    let r = c.recv().unwrap();
+    assert_eq!(r["ok"], json!(false), "{r}");
+}

@@ -187,3 +187,64 @@ fn gpu_power_risk_is_relative_to_stock() {
     assert!(!key_is_risky("cpu.epp", &json!("power"), Some(150.0)));
     assert!(!key_is_risky("gpu.max_mhz", &json!(2000), Some(150.0)));
 }
+
+// ---- stability fingerprint covers only the risky settings ---------------
+
+/// A kept, tested overclock profile; edits then go against it.
+fn kept_profile(c: &mut Core) {
+    call(c, json!({"cmd": "copy", "from": "max", "to": "my-max"})).unwrap();
+    call(c, json!({"cmd": "apply", "profile": "my-max"})).unwrap();
+    call(c, json!({"cmd": "confirm"})).unwrap();
+    call(c, json!({"cmd": "stress-begin", "kind": "cpu"})).unwrap();
+    call(c, json!({"cmd": "stress-end", "kind": "cpu", "passed": true, "errors": 0, "seconds": 60.0})).unwrap();
+    let st = c.status(1);
+    let p = st["profiles"].as_array().unwrap().iter().find(|p| p["name"] == "my-max").unwrap().clone();
+    assert_eq!(p["confirmed"], json!(true), "{p}");
+    assert_eq!(p["cpu_test"]["passed"], json!(true), "{p}");
+}
+
+fn profile_status(c: &Core, name: &str) -> Value {
+    let st = c.status(1);
+    st["profiles"].as_array().unwrap().iter().find(|p| p["name"] == name).unwrap().clone()
+}
+
+#[test]
+fn edit_safe_key_keeps_confirmed_and_results() {
+    let f = Fake::new("edit-safe-kept");
+    let mut c = f.core();
+    kept_profile(&mut c);
+    // Clocks, EPP, ASPM and fans do not affect stability: no new Keep/Revert.
+    let res = call(&mut c, json!({"cmd": "edit", "profile": "my-max", "changes": {"cpu.epp": "power", "gpu.max_mhz": 2000, "platform.aspm": "powersave", "fans.profile": "silent"}})).unwrap();
+    assert_eq!(res["pending"], json!(false), "{res}");
+    assert_eq!(c.active, "my-max");
+    let p = profile_status(&c, "my-max");
+    assert_eq!(p["confirmed"], json!(true), "{p}");
+    assert_eq!(p["cpu_test"]["passed"], json!(true), "{p}");
+    assert_eq!(p["tune"]["cpu"]["epp"], json!("power"));
+    assert!(!f.dir.join("state/dirty").exists(), "no revert window reopened");
+}
+
+#[test]
+fn edit_risky_key_resets_confirmed() {
+    let f = Fake::new("edit-risky-reset");
+    let mut c = f.core();
+    kept_profile(&mut c);
+    let res = call(&mut c, json!({"cmd": "edit", "profile": "my-max", "changes": {"smu.co_all": "-15"}, "apply": true})).unwrap();
+    assert_eq!(res["pending"], json!(true), "{res}");
+    let p = profile_status(&c, "my-max");
+    assert_eq!(p["confirmed"], json!(false), "{p}");
+    assert_eq!(p["cpu_test"], Value::Null, "old test result no longer applies: {p}");
+    call(&mut c, json!({"cmd": "confirm"})).unwrap();
+    assert_eq!(profile_status(&c, "my-max")["confirmed"], json!(true));
+    // Raising GPU power is risky as well.
+    let res = call(&mut c, json!({"cmd": "edit", "profile": "my-max", "changes": {"gpu.power_w": 195}, "apply": true})).unwrap();
+    assert_eq!(res["pending"], json!(true), "{res}");
+    assert_eq!(profile_status(&c, "my-max")["confirmed"], json!(false));
+    call(&mut c, json!({"cmd": "confirm"})).unwrap();
+    // The fingerprint covers the whole gpu.power_w field: any change to it,
+    // even down to a safe value, is a different overclock and so the kept
+    // state no longer applies (the profile is still risky for its SMU limits).
+    let res = call(&mut c, json!({"cmd": "edit", "profile": "my-max", "changes": {"gpu.power_w": 140}})).unwrap();
+    assert_eq!(res["pending"], json!(true), "{res}");
+    assert_eq!(profile_status(&c, "my-max")["confirmed"], json!(false));
+}

@@ -74,7 +74,25 @@ impl Fake {
     }
 
     pub fn paths(&self) -> Paths {
-        Paths { run_dir: self.dir.join("run"), state_dir: self.dir.join("state"), group: "nonexistent-group".into(), kmsg: self.dir.join("kmsg") }
+        Paths {
+            run_dir: self.dir.join("run"),
+            state_dir: self.dir.join("state"),
+            group: "nonexistent-group".into(),
+            kmsg: self.dir.join("kmsg"),
+            bin_dir: self.dir.join("bin"),
+        }
+    }
+
+    /// Install a fake test child (`omarchy-oc` or `omarchy-oc-gpustress`)
+    /// in the bin dir the daemon spawns from: a shell script that gets
+    /// `$OUT` pointing at the fake's directory.
+    pub fn tester(&self, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = self.dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let p = bin.join(name);
+        fs::write(&p, format!("#!/bin/sh\nOUT={}\n{body}\n", self.dir.display())).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     pub fn core(&self) -> Core {

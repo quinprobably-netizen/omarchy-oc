@@ -211,10 +211,14 @@ impl Tune {
         co || limits || gpu_raise
     }
 
-    /// Stable fingerprint, so a stability record can tell whether the
-    /// profile changed since it was tested.
+    /// Stable fingerprint of the settings that bear on stability, so a
+    /// stability record can tell whether the profile changed in a way
+    /// that matters since it was kept or tested. Only the risky settings
+    /// count (every SMU field and the GPU power limit; see [`Tune::risky`]):
+    /// clocks, governor, EPP, GPU profile and window, ASPM and fans can be
+    /// edited live without losing the record or reopening Keep/Revert.
     pub fn fingerprint(&self) -> String {
-        let s = serde_json::to_string(self).unwrap_or_default();
+        let s = serde_json::to_string(&serde_json::json!({"smu": self.smu, "gpu_power_w": self.gpu.power_w})).unwrap_or_default();
         // FNV-1a, 64 bit.
         let mut h: u64 = 0xcbf29ce484222325;
         for b in s.bytes() {
@@ -447,5 +451,34 @@ mod tests {
         let mut b = a.clone();
         b.smu.co_all = Some(-5);
         assert_ne!(a.fingerprint(), b.fingerprint());
+        let mut c = a.clone();
+        c.gpu.power_w = Some(190.0);
+        assert_ne!(a.fingerprint(), c.fingerprint());
+        let mut d = a.clone();
+        d.smu.co_cores.insert(2, -10);
+        assert_ne!(a.fingerprint(), d.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_ignores_safe_settings() {
+        // Everything a safe live edit can touch leaves the fingerprint alone.
+        let mut a = builtins()["max"].clone();
+        let fp = a.fingerprint();
+        a.cpu.epp = Some("power".into());
+        a.cpu.governor = Some("powersave".into());
+        a.cpu.boost = Some(false);
+        a.cpu.max_mhz = Some(4500);
+        a.cpu.smt = Some(false);
+        a.cpu.idle_max = None;
+        a.gpu.min_mhz = None;
+        a.gpu.max_mhz = Some(2000);
+        a.gpu.power_window_ms = Some(50_000);
+        a.gpu.power_profile = Some("power_saving".into());
+        a.platform.aspm = Some("powersave".into());
+        a.fans.profile = Some("silent".into());
+        assert_eq!(a.fingerprint(), fp);
+        // Every key key_is_risky flags changes it.
+        a.smu.stapm_w = Some(100);
+        assert_ne!(a.fingerprint(), fp);
     }
 }

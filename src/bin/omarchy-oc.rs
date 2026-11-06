@@ -293,6 +293,26 @@ extern "C" fn on_sigint(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
+/// Started by the daemon (`OMARCHY_OC_CHILD=1`): it tracks and records the
+/// run itself, so the tester must not call stress-begin / stress-end.
+fn daemon_child() -> bool {
+    std::env::var("OMARCHY_OC_CHILD").is_ok_and(|v| v == "1")
+}
+
+/// Tell the daemon a test starts, unless the daemon started us.
+fn begin_tracking(kind: &str, json_out: bool) -> Result<Value, String> {
+    if daemon_child() {
+        return Err("run by the daemon".into());
+    }
+    let tracked = try_call(json!({"cmd": "stress-begin", "kind": kind}));
+    if let Err(e) = &tracked
+        && !json_out
+    {
+        eprintln!("note: result not recorded ({e})");
+    }
+    tracked
+}
+
 fn stress_cpu(args: &[String], json_out: bool) -> (bool, u64) {
     let seconds: f64 = flag(args, "--seconds").and_then(|s| s.parse().ok()).unwrap_or(120.0);
     let per_core = args.iter().any(|a| a == "--per-core");
@@ -313,12 +333,7 @@ fn stress_cpu(args: &[String], json_out: bool) -> (bool, u64) {
         per_core_seconds: core_seconds,
         inject_fault: args.iter().any(|a| a == "--inject-fault"),
     };
-    let tracked = try_call(json!({"cmd": "stress-begin", "kind": "cpu"}));
-    if let Err(e) = &tracked {
-        if !json_out {
-            eprintln!("note: result not recorded ({e})");
-        }
-    }
+    let tracked = begin_tracking("cpu", json_out);
     let stop = Arc::new(AtomicBool::new(false));
     let s2 = stop.clone();
     std::thread::spawn(move || {
@@ -382,7 +397,7 @@ fn stress_gpu(args: &[String], json_out: bool) -> (bool, u64) {
     if args.iter().any(|a| a == "--inject-fault") {
         cmd.arg("--inject-fault");
     }
-    let tracked = try_call(json!({"cmd": "stress-begin", "kind": "gpu"}));
+    let tracked = begin_tracking("gpu", json_out);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

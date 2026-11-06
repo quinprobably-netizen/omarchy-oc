@@ -20,6 +20,7 @@ use crate::history::{History, SERIES};
 use crate::mem::Mem;
 use crate::platform::Platform;
 use crate::smu::{PmLimits, Smu};
+use crate::testrun::TestRun;
 use crate::tune::{SmuTune, Tune, key_is_risky, value_text};
 use crate::util::{Sys, now, round1, write_atomic};
 use serde_json::{Value, json};
@@ -36,6 +37,8 @@ pub struct Paths {
     pub state_dir: PathBuf,
     pub group: String,
     pub kmsg: PathBuf,
+    /// Where the test children live (`omarchy-oc`, `omarchy-oc-gpustress`).
+    pub bin_dir: PathBuf,
 }
 
 impl Paths {
@@ -63,10 +66,14 @@ struct Pending {
     deadline: f64,
 }
 
+/// A stability test in progress: the daemon's own child ([`Core::test`])
+/// or a CLI run that reported in with `stress-begin`.
 struct StressState {
     kind: String,
     started: f64,
     profile: String,
+    /// Requested length, when known (the daemon's own runs).
+    seconds: Option<u32>,
 }
 
 pub struct Core {
@@ -97,6 +104,8 @@ pub struct Core {
     health: Arc<Health>,
     health_base: (u64, u64),
     stress: Option<StressState>,
+    /// The tester child when the daemon runs the test itself.
+    test: Option<TestRun>,
     hot_secs: u32,
     last_auto: f64,
     last_gap: f64,
@@ -202,6 +211,7 @@ impl Core {
             health,
             health_base: (0, 0),
             stress: None,
+            test: None,
             hot_secs: 0,
             last_auto: 0.0,
             last_gap: boot - mono,
@@ -518,6 +528,7 @@ impl Core {
         if !self.manage {
             return;
         }
+        self.poll_test();
 
         if let Some(p) = &self.pending {
             if t >= p.deadline {
@@ -716,7 +727,7 @@ impl Core {
             "watchdog": self.cfg.watchdog,
             "metrics": {"http": self.cfg.metrics.http, "listen": self.cfg.metrics.listen, "serving": self.metrics_serving},
             "confirm_seconds": self.cfg.confirm_seconds,
-            "stress": self.stress.as_ref().map(|s| json!({"kind": s.kind, "started": s.started, "profile": s.profile})),
+            "stress": self.stress.as_ref().map(|s| json!({"kind": s.kind, "started": s.started, "profile": s.profile, "seconds": s.seconds})),
             "health": {"mce": mce, "gpu_hangs": hangs, "recent": self.health.last.lock().map(|v| v.clone()).unwrap_or_default()},
             "last_report": self.last_report,
             "history": self.history.tail(history),
@@ -746,12 +757,128 @@ impl Core {
 
     /// Hand everything back (daemon exit).
     pub fn shutdown(&mut self) {
+        // A test of our own ends with the daemon: a clean stop is not a
+        // crash, so it leaves no verdict and no dirty marker behind.
+        if let Some(mut t) = self.test.take() {
+            t.stop();
+            self.stress = None;
+        }
         let _ = self.apply_tune(&Tune::default());
         let _ = std::fs::remove_file(self.paths.state("running"));
         let _ = std::fs::remove_file(self.paths.run("active"));
         if self.pending.is_none() && self.stress.is_none() {
             let _ = std::fs::remove_file(self.paths.state("dirty"));
         }
+    }
+
+    // ---- stability tests -----------------------------------------------------
+
+    /// A test starts on the active profile: refuse while settings are
+    /// pending or another test runs; set the dirty marker so a crash under
+    /// test counts against the profile.
+    fn begin_test(&mut self, kind: &str, seconds: Option<u32>) -> Result<Value, String> {
+        if self.stress.is_some() {
+            return Err("a test is already running".into());
+        }
+        if self.pending.is_some() {
+            return Err("confirm or revert the pending settings first".into());
+        }
+        self.set_dirty(&self.active.clone());
+        self.stress = Some(StressState { kind: kind.to_string(), started: now(), profile: self.active.clone(), seconds });
+        self.health_base = self.health.counts();
+        Ok(json!({"profile": self.active}))
+    }
+
+    /// The test that `begin_test` started is over: record its verdict
+    /// against the profile it ran on. `r` carries `passed`, `errors`,
+    /// `seconds`, `detail` and `completed` (false when the run was cut
+    /// short). Kernel-reported hardware errors during the run (machine
+    /// checks; GPU hangs for a GPU test) count as failures too. A run cut
+    /// short without errors says nothing and is not recorded. Returns
+    /// `{profile, result, recorded}`.
+    pub fn record_test(&mut self, kind: &str, r: &Value) -> Result<Value, String> {
+        let st = self.stress.take().ok_or("no stress test running")?;
+        let (m, g) = self.health.counts();
+        let hw_errors = (m - self.health_base.0) + if kind == "gpu" { g - self.health_base.1 } else { 0 };
+        let errors = r.get("errors").and_then(Value::as_u64).unwrap_or(0) + hw_errors;
+        let completed = r.get("completed").and_then(Value::as_bool).unwrap_or(true);
+        let passed = r.get("passed").and_then(Value::as_bool).unwrap_or(false) && hw_errors == 0;
+        let mut detail = r.get("detail").and_then(Value::as_str).unwrap_or("").to_string();
+        if hw_errors > 0 {
+            detail = format!("{detail} {hw_errors} kernel-reported hardware error(s)").trim().to_string();
+        }
+        let res = TestResult {
+            time: now(),
+            seconds: r.get("seconds").and_then(Value::as_f64).unwrap_or(now() - st.started),
+            passed,
+            errors,
+            detail,
+        };
+        let recorded = completed || !passed;
+        if recorded && let Some(t) = self.cfg.profile(&st.profile) {
+            let rec: &mut Stability = self.cfg.stability_mut(&st.profile, &t);
+            if kind == "gpu" {
+                rec.gpu = Some(res.clone());
+            } else {
+                rec.cpu = Some(res.clone());
+            }
+        }
+        self.clear_dirty();
+        self.save_cfg();
+        Ok(json!({"profile": st.profile, "result": res, "recorded": recorded}))
+    }
+
+    /// Each tick: relay the daemon-run test's progress lines as
+    /// `test-progress` events; when it ends, record the verdict and push
+    /// `test-done`.
+    fn poll_test(&mut self) {
+        let Some(run) = self.test.as_mut() else { return };
+        let progress = run.poll();
+        let fin = run.finished();
+        for mut ev in progress {
+            ev["event"] = json!("test-progress");
+            self.push_event(ev);
+        }
+        let Some(fin) = fin else { return };
+        let run = self.test.take().expect("a run was polled");
+        let kind = run.kind.clone();
+        let exit = fin["exit"].as_i64().unwrap_or(2);
+        let errors = fin["errors"].as_u64().unwrap_or(0);
+        let message = fin["message"].as_str().map(str::to_string);
+        // The CPU tester says "not passed" when stopped; gpustress keeps
+        // "passed" and sets "interrupted". Treat both as cut short.
+        let interrupted = fin["interrupted"] == json!(true) || run.stopped() || message.as_deref() == Some("stopped before the end");
+        let could_not_run = exit == 2;
+        let completed = !interrupted && !could_not_run;
+        // Cut short with no errors: no verdict (record_test then skips it).
+        let passed = errors == 0 && !could_not_run && (fin["passed"] == json!(true) || interrupted);
+        let detail = message.unwrap_or_else(|| {
+            if kind == "gpu" {
+                format!("{} GFLOPS, {} GB/s", round1(fin["gflops"].as_f64().unwrap_or(0.0)), round1(fin["vram_gbps"].as_f64().unwrap_or(0.0)))
+            } else {
+                format!("{}, {} blocks", fin["isa"].as_str().unwrap_or("?"), fin["blocks"].as_u64().unwrap_or(0))
+            }
+        });
+        let r = json!({"passed": passed, "errors": errors, "seconds": fin["t"], "detail": detail, "completed": completed});
+        let ev = match self.record_test(&kind, &r) {
+            Ok(v) => {
+                let recorded = v["recorded"] == json!(true);
+                let res = &v["result"];
+                self.message = format!(
+                    "{} test {} on \"{}\"",
+                    kind,
+                    if interrupted && recorded { "stopped with errors" } else if interrupted { "stopped" } else if res["passed"] == json!(true) { "passed" } else { "FAILED" },
+                    v["profile"].as_str().unwrap_or("")
+                );
+                json!({
+                    "event": "test-done", "kind": kind, "profile": v["profile"],
+                    "passed": recorded && res["passed"] == json!(true), "errors": res["errors"],
+                    "interrupted": interrupted, "recorded": recorded, "seconds": res["seconds"], "detail": res["detail"],
+                })
+            }
+            Err(e) => json!({"event": "test-done", "kind": kind, "passed": false, "errors": errors, "interrupted": interrupted, "recorded": false, "detail": e}),
+        };
+        self.push_event(ev);
     }
 
     // ---- requests ------------------------------------------------------------
@@ -966,45 +1093,41 @@ impl Core {
             }
             "stress-begin" => {
                 let kind = s("kind").unwrap_or("cpu").to_string();
+                self.begin_test(&kind, None)
+            }
+            "stress-end" => {
+                let kind = match s("kind") {
+                    Some(k) => k.to_string(),
+                    None => self.stress.as_ref().map(|st| st.kind.clone()).ok_or("no stress test running")?,
+                };
+                self.record_test(&kind, req)
+            }
+            "test-start" => {
+                // The daemon runs the tester as its own child and streams
+                // its progress as events; see `poll_test`.
+                let kind = s("kind").unwrap_or("cpu").to_string();
+                if !["cpu", "cpu-per-core", "gpu"].contains(&kind.as_str()) {
+                    return Err(format!("test kind must be cpu, cpu-per-core or gpu, not \"{kind}\""));
+                }
+                let seconds = req.get("seconds").and_then(Value::as_u64).unwrap_or(120).clamp(5, 86_400) as u32;
+                // Ours, or a CLI run that reported in with stress-begin.
+                if self.test.is_some() || self.stress.is_some() {
+                    return Err("a test is already running".into());
+                }
                 if self.pending.is_some() {
                     return Err("confirm or revert the pending settings first".into());
                 }
-                self.set_dirty(&self.active.clone());
-                self.stress = Some(StressState { kind, started: now(), profile: self.active.clone() });
-                self.health_base = self.health.counts();
-                Ok(json!({"profile": self.active}))
+                let cores = self.cpu.threads.iter().map(|t| t.core).collect::<std::collections::BTreeSet<_>>().len();
+                let run = TestRun::start(&kind, seconds, cores, &self.paths.bin_dir).map_err(|e| format!("cannot start the {kind} test: {e}"))?;
+                let r = self.begin_test(&kind, Some(seconds))?;
+                self.test = Some(run);
+                self.message = format!("Running the {kind} stability test on \"{}\"", self.active);
+                Ok(json!({"kind": kind, "seconds": seconds, "profile": r["profile"]}))
             }
-            "stress-end" => {
-                let st = self.stress.take().ok_or("no stress test running")?;
-                let (m, g) = self.health.counts();
-                let hw_errors = (m - self.health_base.0) + if st.kind == "gpu" { g - self.health_base.1 } else { 0 };
-                let errors = req.get("errors").and_then(Value::as_u64).unwrap_or(0) + hw_errors;
-                let completed = b("completed").unwrap_or(true);
-                let passed = b("passed").unwrap_or(false) && hw_errors == 0;
-                let mut detail = s("detail").unwrap_or("").to_string();
-                if hw_errors > 0 {
-                    detail = format!("{detail} {hw_errors} kernel-reported hardware error(s)").trim().to_string();
-                }
-                let res = TestResult {
-                    time: now(),
-                    seconds: req.get("seconds").and_then(Value::as_f64).unwrap_or(now() - st.started),
-                    passed,
-                    errors,
-                    detail,
-                };
-                if completed || !passed {
-                    if let Some(t) = self.cfg.profile(&st.profile) {
-                        let rec: &mut Stability = self.cfg.stability_mut(&st.profile, &t);
-                        if st.kind == "gpu" {
-                            rec.gpu = Some(res.clone());
-                        } else {
-                            rec.cpu = Some(res.clone());
-                        }
-                    }
-                }
-                self.clear_dirty();
-                self.save_cfg();
-                Ok(json!({"profile": st.profile, "result": res}))
+            "test-stop" => {
+                let t = self.test.as_mut().ok_or("no test running")?;
+                t.stop();
+                Ok(json!({"kind": t.kind}))
             }
             "history" => Ok(self.history.tail(req.get("seconds").and_then(Value::as_u64).unwrap_or(3600) as usize)),
             "csv" => Ok(Value::String(self.history.csv(req.get("seconds").and_then(Value::as_f64)))),

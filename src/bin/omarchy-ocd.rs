@@ -25,6 +25,7 @@ fn main() {
         state_dir: PathBuf::from(arg(&args, "--state-dir").unwrap_or_else(|| "/var/lib/omarchy-oc".into())),
         group: arg(&args, "--group").unwrap_or_else(|| "wheel".into()),
         kmsg: PathBuf::from(arg(&args, "--kmsg").unwrap_or_else(|| "/dev/kmsg".into())),
+        bin_dir: PathBuf::from(arg(&args, "--bin-dir").unwrap_or_else(|| "/usr/local/bin".into())),
     };
     let sys = Sys::from_env();
     match args.first().map(String::as_str) {
@@ -51,7 +52,7 @@ fn main() {
             println!("{}", serde_json::to_string_pretty(&core.status(5)).unwrap_or_default());
         }
         _ => {
-            eprintln!("usage: omarchy-ocd run|restore|detect [--run-dir D] [--state-dir D] [--group G]");
+            eprintln!("usage: omarchy-ocd run|restore|detect [--run-dir D] [--state-dir D] [--group G] [--bin-dir D]");
             std::process::exit(2);
         }
     }

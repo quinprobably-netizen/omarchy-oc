@@ -19,5 +19,6 @@ pub mod platform;
 pub mod server;
 pub mod smu;
 pub mod stress;
+pub mod testrun;
 pub mod tune;
 pub mod util;
