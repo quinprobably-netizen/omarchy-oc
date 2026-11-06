@@ -100,26 +100,33 @@ function clampClock(which, v, minMhz, maxMhz) {
   return n
 }
 
+function pendingValue(map, key) {
+  if (!map || !Object.prototype.hasOwnProperty.call(map, key)) return null
+  return num(map[key])
+}
+
 // The clock the daemon will validate against, which is what the slider
-// shows: a live edit still in the 250 ms batch, then the profile's tune,
-// then the hardware knob (the value the tune falls back to when unset).
-function shownClock(which, liveChanges, tune, k) {
+// shows: a live edit still in the 250 ms batch, then one sent but not yet
+// in a status (`inflight`, see Model.addInflight), then the profile's
+// tune, then the hardware knob (the value the tune falls back to when
+// unset).
+function shownClock(which, liveChanges, tune, k, inflight) {
   var key = which === "max" ? "gpu.max_mhz" : "gpu.min_mhz"
   var field = which === "max" ? "max_mhz" : "min_mhz"
-  if (liveChanges && Object.prototype.hasOwnProperty.call(liveChanges, key)) {
-    var l = num(liveChanges[key])
-    if (l !== null) return l
-  }
+  var l = pendingValue(liveChanges, key)
+  if (l !== null) return l
+  var f = pendingValue(inflight, key)
+  if (f !== null) return f
   var t = tune ? num(tune[field]) : null
   if (t !== null) return t
   return k ? num(k[field]) : null
 }
 
 // A clock edit clamped against the other clock as the daemon will see it,
-// so two drags inside one batch (min up to 2000, then max down to 1800)
-// still send a valid pair.
-function clampClockEdit(which, v, liveChanges, tune, k) {
-  var other = shownClock(which === "max" ? "min" : "max", liveChanges, tune, k)
+// so two drags inside one batch (min up to 2000, then max down to 1800),
+// or one right after the other batch went out, still send a valid pair.
+function clampClockEdit(which, v, liveChanges, tune, k, inflight) {
+  var other = shownClock(which === "max" ? "min" : "max", liveChanges, tune, k, inflight)
   return which === "max" ? clampClock("max", v, other, null) : clampClock("min", v, null, other)
 }
 

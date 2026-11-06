@@ -39,8 +39,9 @@ Column {
   // then the profile's tune, then the hardware knob. The sliders show
   // these and clamp against them, so the pair sent is never min > max.
   readonly property var liveChanges: root.liveChanges
-  readonly property var shownMax: Gpu.shownClock("max", liveChanges, gpuTune, knobs)
-  readonly property var shownMin: Gpu.shownClock("min", liveChanges, gpuTune, knobs)
+  readonly property var inflight: root.inflightChanges
+  readonly property var shownMax: Gpu.shownClock("max", liveChanges, gpuTune, knobs, inflight)
+  readonly property var shownMin: Gpu.shownClock("min", liveChanges, gpuTune, knobs, inflight)
   readonly property var clients: Gpu.gpuClients(st)
   readonly property string throttle: Gpu.throttleText(st)
   readonly property var chartSeries: Gpu.chartSeries(st, { clock: String(accent), temp: "#e8c26a", power: "#ff6b8b" }, strings.t("gpu.idle"))
@@ -192,7 +193,7 @@ Column {
     step: 50
     unit: " MHz"
     foreground: page.fg; accent: page.accent; fontFamily: page.fontFamily
-    onMoved: function(v) { page.edit("gpu.max_mhz", Gpu.clampClockEdit("max", v, page.root.liveChanges, page.gpuTune, page.knobs)) }
+    onMoved: function(v) { page.edit("gpu.max_mhz", Gpu.clampClockEdit("max", v, page.root.liveChanges, page.gpuTune, page.knobs, page.root.inflightChanges)) }
   }
 
   LimitSlider {
@@ -206,7 +207,7 @@ Column {
     step: 50
     unit: " MHz"
     foreground: page.fg; accent: page.accent; fontFamily: page.fontFamily
-    onMoved: function(v) { page.edit("gpu.min_mhz", Gpu.clampClockEdit("min", v, page.root.liveChanges, page.gpuTune, page.knobs)) }
+    onMoved: function(v) { page.edit("gpu.min_mhz", Gpu.clampClockEdit("min", v, page.root.liveChanges, page.gpuTune, page.knobs, page.root.inflightChanges)) }
   }
 
   // ---- power profile + throttle state ----

@@ -50,6 +50,10 @@ Panel {
   property bool cursorActive: false
   property var staged: Model.emptyStaged()
   property var liveChanges: ({})
+  // Live batches sent but not yet reflected in a status (Model.addInflight):
+  // a page that must not contradict a value the daemon is about to hold
+  // (the GPU clock pair) reads these between liveChanges and the tune.
+  property var inflightChanges: ({})
   property string error: ""
   property var lastReport: null
 
@@ -85,11 +89,21 @@ Panel {
     var t = Model.takeLive(liveChanges, Model.activeProfile(oc.status))
     liveChanges = t.keep
     if (t.send === null) return
-    oc.request("edit", { profile: t.profile, changes: t.send }, requestDone)
+    var sent = t.send
+    inflightChanges = Model.addInflight(inflightChanges, sent)
+    oc.request("edit", { profile: t.profile, changes: sent }, function(ok, r) {
+      // A refused batch never reaches the tune: forget it now.
+      if (!ok) root.inflightChanges = Model.clearInflight(root.inflightChanges, Object.keys(sent))
+      root.requestDone(ok, r)
+    })
   }
 
+  // Each status settles the in-flight keys the active profile's tune now
+  // carries; a drop forgets them all (nothing sent can be trusted after it).
+  onStatusChanged: if (status) inflightChanges = Model.settleInflight(inflightChanges, status)
+
   onAliveChanged: {
-    if (!alive) return
+    if (!alive) { inflightChanges = {}; return }
     root.error = ""
     flushLive()
   }

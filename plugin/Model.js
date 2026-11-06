@@ -506,6 +506,59 @@ function takeLive(changes, profile) {
   return { send: null, keep: has ? changes : {}, profile: p }
 }
 
+// ---- in-flight live edits -------------------------------------------------
+//
+// A live batch leaves `liveChanges` the moment it is sent, but the daemon
+// only shows it in a status ~1 s later. Until then the sent values are the
+// daemon's view (a clock clamp must see them), so Panel keeps them here.
+
+// A new map: `inflight` with `sent` on top.
+function addInflight(inflight, sent) {
+  var out = {}
+  for (var k in inflight || {}) out[k] = inflight[k]
+  for (var s in sent || {}) out[s] = sent[s]
+  return out
+}
+
+// A new map without `keys`; no keys means everything (an error reply, a
+// disconnect: nothing in flight can be trusted any more).
+function clearInflight(inflight, keys) {
+  if (!keys) return {}
+  var out = {}
+  for (var k in inflight || {}) if (keys.indexOf(k) < 0) out[k] = inflight[k]
+  return out
+}
+
+// The tune value a dotted key names ("gpu.min_mhz", "smu.co_cores.2").
+function tuneValue(tune, key) {
+  var node = tune
+  var parts = String(key).split(".")
+  for (var i = 0; i < parts.length; i++) {
+    if (node === null || node === undefined || typeof node !== "object") return undefined
+    node = node[parts[i]]
+  }
+  return node
+}
+
+function sameValue(a, b) {
+  if (clears(a) && clears(b)) return true
+  var na = num(a), nb = num(b)
+  if (na !== null && nb !== null) return na === nb
+  return String(a) === String(b)
+}
+
+// A new map without the keys the active profile's tune now reflects.
+function settleInflight(inflight, st) {
+  var p = profileEntry(st, st ? st.active : null)
+  var tune = p && p.tune ? p.tune : null
+  var out = {}
+  for (var k in inflight || {}) {
+    var have = tune ? tuneValue(tune, k) : undefined
+    if (have === undefined || !sameValue(have, inflight[k])) out[k] = inflight[k]
+  }
+  return out
+}
+
 // ---- connection -----------------------------------------------------------
 
 // What a callback gets as its error when the connection drops under an
@@ -533,6 +586,7 @@ if (typeof module !== "undefined") {
     fansTile: fansTile, offlineHint: offlineHint, pendingRemaining: pendingRemaining, pendingInfo: pendingInfo,
     barLabel: barLabel, tooltip: tooltip, nextFavourite: nextFavourite, reconnect: reconnect,
     takeLive: takeLive, activeProfile: activeProfile, DISCONNECTED: DISCONNECTED, requestError: requestError,
+    addInflight: addInflight, clearInflight: clearInflight, settleInflight: settleInflight, tuneValue: tuneValue,
     unstage: unstage, LIMIT_BOUNDS: LIMIT_BOUNDS, limitRow: limitRow, shownLimit: shownLimit, stagedHas: stagedHas,
     coAll: coAll, coreTiles: coreTiles, tierLabel: tierLabel, idleMax: idleMax, cpuHeadline: cpuHeadline,
     smuDisabledReason: smuDisabledReason, fmtCo: fmtCo, edcFor: edcFor, EPP_OPTIONS: EPP_OPTIONS,

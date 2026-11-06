@@ -168,3 +168,17 @@ test("rail: gpu and memory are wired", () => {
   assert.equal(M.pageSource("gpu"), "pages/Gpu.qml")
   assert.equal(M.pageSource("memory"), "pages/Memory.qml")
 })
+
+test("shownClock / clampClockEdit consult the in-flight batch between the live batch and the tune", () => {
+  const knobs = status.gpu.knobs
+  // Min 2000 flushed (in flight, no new status yet): max 1800 goes out as 2000.
+  const inflight = { "gpu.min_mhz": 2000 }
+  assert.equal(G.shownClock("min", {}, null, knobs, inflight), 2000)
+  assert.equal(G.clampClockEdit("max", 1800, {}, null, knobs, inflight), 2000)
+  // A newer live edit wins over the in-flight one; the tune loses to both.
+  assert.equal(G.shownClock("min", { "gpu.min_mhz": 1200 }, { min_mhz: 900 }, knobs, inflight), 1200)
+  assert.equal(G.shownClock("min", {}, { min_mhz: 900 }, knobs, inflight), 2000)
+  assert.equal(G.clampClockEdit("max", 1000, {}, { min_mhz: 900 }, knobs, inflight), 2000)
+  // Once settled (status shows tune min 2000) the tune carries it.
+  assert.equal(G.clampClockEdit("max", 1800, {}, { min_mhz: 2000 }, knobs, {}), 2000)
+})

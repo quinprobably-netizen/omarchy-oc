@@ -452,3 +452,34 @@ test("requestError ignores success and the disconnect sentinel", () => {
   assert.equal(M.requestError(false, "risky changes need Apply: smu.co_all"), "risky changes need Apply: smu.co_all")
   assert.equal(M.requestError(false, null), "request failed")
 })
+
+// ---- in-flight live edits ---------------------------------------------------
+
+test("addInflight / clearInflight keep a sent batch until it is accounted for", () => {
+  const a = M.addInflight({}, { "gpu.min_mhz": 2000 })
+  assert.deepEqual(a, { "gpu.min_mhz": 2000 })
+  const b = M.addInflight(a, { "cpu.epp": "power", "gpu.min_mhz": 2100 })
+  assert.deepEqual(b, { "gpu.min_mhz": 2100, "cpu.epp": "power" })
+  assert.deepEqual(a, { "gpu.min_mhz": 2000 }, "input not mutated")
+  assert.deepEqual(M.addInflight(null, null), {})
+  assert.deepEqual(M.clearInflight(b, ["gpu.min_mhz"]), { "cpu.epp": "power" })
+  assert.deepEqual(M.clearInflight(b, null), {}, "no keys: everything (error reply, disconnect)")
+  assert.deepEqual(M.clearInflight(null, ["x"]), {})
+})
+
+test("settleInflight drops the keys the active profile's tune now reflects", () => {
+  const inflight = { "gpu.min_mhz": 2000, "gpu.max_mhz": 2200, "cpu.epp": "power", "smu.co_cores.2": -20, "cpu.boost": null }
+  const st = {
+    active: "custom",
+    profiles: [
+      { name: "stock", tune: { gpu: { min_mhz: 2000, max_mhz: 2200 }, cpu: { epp: "power" } } },
+      { name: "custom", tune: { gpu: { min_mhz: 2000, max_mhz: null }, cpu: { epp: "balance_power", boost: null }, smu: { co_cores: { "2": -20 } } } },
+    ],
+  }
+  assert.deepEqual(M.settleInflight(inflight, st), { "gpu.max_mhz": 2200, "cpu.epp": "power" })
+  assert.deepEqual(M.settleInflight(inflight, null), inflight, "no status: nothing settles")
+  assert.deepEqual(M.settleInflight(inflight, { active: "nope", profiles: [] }), inflight)
+  assert.deepEqual(M.settleInflight({}, st), {})
+  // A numeric value sent as a string settles against the number the daemon stores.
+  assert.deepEqual(M.settleInflight({ "gpu.min_mhz": "2000" }, st), {})
+})
