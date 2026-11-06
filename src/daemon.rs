@@ -23,12 +23,9 @@ use crate::smu::{PmLimits, Smu};
 use crate::tune::{SmuTune, Tune};
 use crate::util::{Sys, now, round1, write_atomic};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write as _};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 pub static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -42,7 +39,7 @@ pub struct Paths {
 }
 
 impl Paths {
-    fn run(&self, f: &str) -> PathBuf {
+    pub fn run(&self, f: &str) -> PathBuf {
         self.run_dir.join(f)
     }
     fn state(&self, f: &str) -> PathBuf {
@@ -108,6 +105,8 @@ pub struct Core {
     pub metrics_latest: Arc<Mutex<String>>,
     metrics_serving: bool,
     last_report: Value,
+    /// Queued for the socket server to push to subscribers.
+    events: Vec<Value>,
     /// False for `detect`: sample only, never write.
     manage: bool,
 }
@@ -211,6 +210,7 @@ impl Core {
             metrics_latest: Arc::new(Mutex::new(String::new())),
             metrics_serving: false,
             last_report: Value::Null,
+            events: Vec::new(),
             manage,
         };
         core.write_info();
@@ -234,6 +234,52 @@ impl Core {
         }
     }
 
+    // ---- events for socket subscribers -------------------------------------
+
+    pub fn push_event(&mut self, ev: Value) {
+        self.events.push(ev);
+    }
+
+    pub fn take_events(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.events)
+    }
+
+    fn pending_json(&self) -> Value {
+        let t = now();
+        self.pending
+            .as_ref()
+            .map(|p| json!({"profile": p.profile, "previous": p.previous, "remaining": (p.deadline - t).max(0.0).round()}))
+            .unwrap_or(Value::Null)
+    }
+
+    /// `{"event":"pending","pending":{...}|null}` whenever the pending state
+    /// is set or cleared.
+    fn set_pending(&mut self, p: Option<Pending>) {
+        let changed = match (&self.pending, &p) {
+            (None, None) => false,
+            (Some(a), Some(b)) => a.profile != b.profile,
+            _ => true,
+        };
+        self.pending = p;
+        if changed {
+            let ev = json!({"event": "pending", "pending": self.pending_json()});
+            self.push_event(ev);
+        }
+    }
+
+    fn take_pending(&mut self) -> Option<Pending> {
+        let p = self.pending.take();
+        if p.is_some() {
+            self.push_event(json!({"event": "pending", "pending": Value::Null}));
+        }
+        p
+    }
+
+    fn set_alert(&mut self, text: String) {
+        self.push_event(json!({"event": "alert", "text": text}));
+        self.alert = Some(text);
+    }
+
     /// Crash guard and boot apply.
     fn startup(&mut self) {
         let marker = |p: PathBuf| -> Option<(String, String)> {
@@ -252,7 +298,7 @@ impl Core {
                     s.crashes += 1;
                     s.confirmed = false;
                 }
-                self.alert = Some(format!(
+                self.set_alert(format!(
                     "The last boot ended while \"{profile}\" was unconfirmed or under test. Started at stock settings."
                 ));
             }
@@ -267,7 +313,7 @@ impl Core {
                     if crashes >= 2 {
                         crashed = true;
                         self.cfg.boot_apply = false;
-                        self.alert = Some(format!(
+                        self.set_alert(format!(
                             "\"{profile}\" was active during {crashes} unclean shutdowns in a row. Apply-at-boot is now off."
                         ));
                     }
@@ -388,11 +434,11 @@ impl Core {
             self.auto_blocked = None;
             self.alert = None;
         }
-        self.pending = if risky && !confirmed && origin == Origin::User {
+        self.set_pending(if risky && !confirmed && origin == Origin::User {
             Some(Pending { profile: name.to_string(), previous, deadline: now() + self.cfg.confirm_seconds as f64 })
         } else {
             None
-        };
+        });
         self.clear_dirty();
         self.save_cfg();
         self.write_running();
@@ -408,7 +454,7 @@ impl Core {
     }
 
     fn confirm(&mut self) -> Result<Value, String> {
-        let p = self.pending.take().ok_or("nothing to confirm")?;
+        let p = self.take_pending().ok_or("nothing to confirm")?;
         if let Some(t) = self.cfg.profile(&p.profile) {
             let s = self.cfg.stability_mut(&p.profile, &t);
             s.confirmed = true;
@@ -421,7 +467,7 @@ impl Core {
     }
 
     fn revert(&mut self, why: &str) -> Result<Value, String> {
-        let p = self.pending.take().ok_or("nothing to revert")?;
+        let p = self.take_pending().ok_or("nothing to revert")?;
         let r = self.apply_profile(&p.previous, Origin::Revert);
         self.cfg.base = p.previous.clone();
         self.save_cfg();
@@ -432,13 +478,13 @@ impl Core {
     fn fallback(&mut self, reason: String) {
         let fb = self.cfg.watchdog.fallback.clone();
         let fb = if self.cfg.profile_exists(&fb) { fb } else { "stock".into() };
-        self.pending = None;
+        self.set_pending(None);
         if let Some(a) = self.auto_profile.clone() {
             self.auto_blocked = Some(a);
         }
         let prev = self.active.clone();
         let _ = self.apply_profile(&fb, Origin::Watchdog);
-        self.alert = Some(format!("Watchdog: {reason}. Switched from \"{prev}\" to \"{fb}\"."));
+        self.set_alert(format!("Watchdog: {reason}. Switched from \"{prev}\" to \"{fb}\"."));
         self.message = self.alert.clone().unwrap_or_default();
     }
 
@@ -639,7 +685,7 @@ impl Core {
             "auto_profile": self.auto_profile,
             "boot_apply": self.cfg.boot_apply,
             "auto_switch": self.cfg.auto_switch,
-            "pending": self.pending.as_ref().map(|p| json!({"profile": p.profile, "previous": p.previous, "remaining": (p.deadline - t).max(0.0).round()})),
+            "pending": self.pending_json(),
             "message": self.message,
             "alert": self.alert,
             "caps": {
@@ -1014,116 +1060,6 @@ pub fn rule_matches(r: &Rule, procs: &[Proc]) -> bool {
         "gamemode" => procs.iter().any(|p| p.gamemode),
         _ => false,
     }
-}
-
-// ---- socket server -------------------------------------------------------------
-
-fn group_id(name: &str) -> Option<libc::gid_t> {
-    let c = std::ffi::CString::new(name).ok()?;
-    let g = unsafe { libc::getgrnam(c.as_ptr()) };
-    if g.is_null() { None } else { Some(unsafe { (*g).gr_gid }) }
-}
-
-fn serve_client(core: Arc<Mutex<Core>>, stream: UnixStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let mut w = match stream.try_clone() {
-        Ok(w) => w,
-        Err(_) => return,
-    };
-    let mut line = String::new();
-    if BufReader::new(stream).take_line(&mut line).is_err() {
-        return;
-    }
-    let reply = match serde_json::from_str::<Value>(&line) {
-        // Fan commands go straight to omarchy-fand without holding the core
-        // lock: calibration takes minutes.
-        Ok(req) if req.get("cmd").and_then(Value::as_str) == Some("fans") => {
-            let sys = match core.lock() {
-                Ok(c) => c.sys.clone(),
-                Err(p) => p.into_inner().sys.clone(),
-            };
-            match fans_proxy(&Fans::new(&sys), &req) {
-                Ok(v) => json!({"ok": true, "result": v}),
-                Err(e) => json!({"ok": false, "error": e}),
-            }
-        }
-        Ok(req) => {
-            let mut c = match core.lock() {
-                Ok(c) => c,
-                Err(p) => p.into_inner(),
-            };
-            match c.handle(&req) {
-                Ok(v) => json!({"ok": true, "result": v}),
-                Err(e) => json!({"ok": false, "error": e}),
-            }
-        }
-        Err(_) => json!({"ok": false, "error": "request is not JSON"}),
-    };
-    let _ = w.write_all(format!("{reply}\n").as_bytes());
-}
-
-trait TakeLine {
-    fn take_line(self, buf: &mut String) -> std::io::Result<usize>;
-}
-impl<R: std::io::Read> TakeLine for BufReader<R> {
-    fn take_line(self, buf: &mut String) -> std::io::Result<usize> {
-        // Cap requests at 256 KiB.
-        use std::io::Read;
-        let mut limited = BufReader::new(self.take(256 * 1024));
-        limited.read_line(buf)
-    }
-}
-
-pub fn run(sys: Sys, paths: Paths) -> std::io::Result<()> {
-    let core = Arc::new(Mutex::new(Core::new(sys, paths.clone())));
-    if let Ok(mut c) = core.lock() {
-        c.start_metrics();
-        c.tick();
-    }
-    let sock = paths.run("control.sock");
-    let _ = std::fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock)?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let gid = group_id(&paths.group);
-        if let (Some(gid), Ok(c)) = (gid, std::ffi::CString::new(sock.to_string_lossy().as_bytes())) {
-            unsafe { libc::chown(c.as_ptr(), 0, gid) };
-        }
-        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(if gid.is_some() { 0o660 } else { 0o600 }))?;
-    }
-    let lc = core.clone();
-    std::thread::spawn(move || {
-        let slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        for s in listener.incoming().flatten() {
-            if slots.load(Ordering::Relaxed) >= 16 {
-                continue;
-            }
-            slots.fetch_add(1, Ordering::Relaxed);
-            let (c, sl) = (lc.clone(), slots.clone());
-            std::thread::spawn(move || {
-                serve_client(c, s);
-                sl.fetch_sub(1, Ordering::Relaxed);
-            });
-        }
-    });
-    let mut next = std::time::Instant::now();
-    while !SIGNAL_STOP.load(Ordering::Relaxed) {
-        next += Duration::from_secs(1);
-        if let Ok(mut c) = core.lock() {
-            c.tick();
-        }
-        let now_i = std::time::Instant::now();
-        if next > now_i {
-            std::thread::sleep(next - now_i);
-        } else {
-            next = now_i;
-        }
-    }
-    if let Ok(mut c) = core.lock() {
-        c.shutdown();
-    }
-    let _ = std::fs::remove_file(&sock);
-    Ok(())
 }
 
 /// `omarchy-ocd restore`: put back every snapshotted knob and the SMU stock

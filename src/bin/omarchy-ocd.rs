@@ -5,6 +5,7 @@
 //!   omarchy-ocd detect    print one status snapshot and exit (any user)
 
 use omarchy_oc::daemon::{self, Paths, SIGNAL_STOP};
+use omarchy_oc::server;
 use omarchy_oc::util::Sys;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -32,7 +33,7 @@ fn main() {
                 libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
                 libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
             }
-            if let Err(e) = daemon::run(sys, paths) {
+            if let Err(e) = server::run(sys, paths) {
                 eprintln!("omarchy-ocd: {e}");
                 std::process::exit(1);
             }

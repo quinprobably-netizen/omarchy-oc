@@ -16,6 +16,7 @@ pub mod history;
 pub mod mem;
 pub mod metrics;
 pub mod platform;
+pub mod server;
 pub mod smu;
 pub mod stress;
 pub mod tune;
