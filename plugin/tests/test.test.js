@@ -165,6 +165,37 @@ test("pushEvent keeps one line per phase, starts over after a done line, ignores
   assert.equal(other.length, 1, "a line of another kind is a new test")
 })
 
+test("pushEvent stays bounded over a long GPU run in mixed mode", () => {
+  const gpuLine = (t, phase) => ({ event: "test-progress", kind: "gpu", t, mode: "mixed", phase, iterations: t * 4, errors: 0, gflops: phase === "compute" ? 9876.5 : null, vram_gbps: phase === "vram" ? 412.3 : null, adapter: "Intel Arc A580" })
+  let ev = []
+  for (let i = 0; i < 1000; i++) ev = T.pushEvent(ev, gpuLine(i * 5, i % 2 === 0 ? "compute" : "vram"))
+  assert.equal(ev.length, 1, "a GPU run keeps only its latest line")
+  assert.equal(ev[0].t, 4995)
+  const c = { kind: "gpu", seconds: 6000, cores, tune: null }
+  const v = T.testView(ev, c)
+  assert.equal(v.phase, "vram")
+  assert.equal(v.rate, "412 GB/s")
+  assert.equal(v.pct, 83)
+  assert.equal(v.left, 1005)
+  assert.equal(v.running, true)
+  ev = T.pushEvent(ev, { event: "test-done", kind: "gpu", passed: true, errors: 0, interrupted: false, recorded: true, seconds: 6000, detail: "9877 GFLOPS, 412 GB/s" })
+  assert.equal(ev.length, 2)
+  assert.equal(T.testView(ev, c).done.passed, true)
+})
+
+test("pushEvent replaces a repeated CPU phase wherever it was, and caps the list", () => {
+  let ev = [progress(0, "reference"), progress(30, "all cores"), progress(40, "core 0"), progress(50, "core 1")]
+  ev = T.pushEvent(ev, progress(60, "core 0"))
+  assert.deepEqual(ev.map(e => e.phase), ["reference", "all cores", "core 1", "core 0"], "the latest line is last")
+  assert.equal(ev[3].t, 60)
+  const v = T.testView(ev, ctx)
+  assert.equal(v.phase, "core 0")
+  assert.equal(v.cores[1].state, "ok", "core 1's phase is over")
+  for (let i = 0; i < 500; i++) ev = T.pushEvent(ev, progress(100 + i, "phase " + i))
+  assert.equal(ev.length, T.MAX_EVENTS)
+  assert.equal(ev[ev.length - 1].phase, "phase 499", "the oldest lines go, the latest stays")
+})
+
 test("testHistory lists every recorded result, newest first", () => {
   const st = {
     profiles: [

@@ -80,18 +80,35 @@ function phaseCore(phase) {
 function isProgress(ev) { return !!ev && ev.event === "test-progress" }
 function isDone(ev) { return !!ev && ev.event === "test-done" }
 
+// Longest the page's event list gets: a CPU run has 2 + cores phases, so
+// this is only a backstop against a tester that keeps inventing phases.
+var MAX_EVENTS = 64
+
 // The page's event list: one line per phase (a later line of the same
-// phase replaces the earlier one, so the list stays a few entries long), the
-// done event last. A line after the done event, or of another kind, starts
-// a new test. Returns a new array; other events leave the list as it is.
+// phase replaces the earlier one wherever it was, and goes last, so the
+// list stays a few entries long and the latest line is the last), the done
+// event after them. A GPU run keeps only its latest line: gpustress
+// alternates compute and vram phases every few seconds and the page tracks
+// no per-core state for it. A line after the done event, or of another
+// kind, starts a new test. Returns a new array; other events leave the
+// list as it is.
 function pushEvent(events, ev) {
   var list = events || []
   if (!isProgress(ev) && !isDone(ev)) return list
   var last = list.length > 0 ? list[list.length - 1] : null
   var fresh = last === null || isDone(last) || String(last.kind) !== String(ev.kind)
-  var out = fresh ? [] : list.slice()
-  if (isProgress(ev) && out.length > 0 && String(out[out.length - 1].phase) === String(ev.phase)) out.pop()
+  var out = []
+  if (!fresh) {
+    var phase = isProgress(ev) ? String(ev.phase) : null
+    var gpu = String(ev.kind) === "gpu"
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i]
+      if (isProgress(e) && phase !== null && (gpu || String(e.phase) === phase)) continue
+      out.push(e)
+    }
+  }
   out.push(ev)
+  while (out.length > MAX_EVENTS) out.shift()
   return out
 }
 
@@ -273,7 +290,7 @@ function testHistory(st) {
 
 if (typeof module !== "undefined") {
   module.exports = {
-    KINDS: KINDS, LENGTHS: LENGTHS, MIN_CORE_SECONDS: MIN_CORE_SECONDS,
+    KINDS: KINDS, LENGTHS: LENGTHS, MIN_CORE_SECONDS: MIN_CORE_SECONDS, MAX_EVENTS: MAX_EVENTS,
     fmtClock: fmtClock, fmtLength: fmtLength, fmtCo: fmtCo, totalSeconds: totalSeconds, phaseCore: phaseCore,
     pushEvent: pushEvent, testView: testView, tileStates: tileStates, testHistory: testHistory, coFor: coFor
   }
