@@ -5,7 +5,7 @@ import qs.Commons as Commons
 
 // One automation rule: "‹when›   [profile]   ✕". Clicking the profile pill
 // unfolds a picker under the row. The caller owns the values: bind `label`,
-// `profile` and `profiles`, act on `profileChanged(name)` and `removed()`.
+// `profile` and `profiles`, act on `picked(name)` and `removed()`.
 // `label` is daemon text (a process name), so every sink is PlainText.
 Column {
   id: rule
@@ -19,8 +19,11 @@ Column {
   property color accent: Commons.Color.accent
   property color urgent: Commons.Color.urgent
   property string fontFamily: Style.font.family
+  // Owned by the caller too (the page keeps which row is open, so a
+  // rebuilt delegate comes back open): bind it and act on `toggled()`.
   property bool picking: false
 
+  signal toggled()
   signal picked(string profile)
   signal removed()
 
@@ -82,7 +85,7 @@ Column {
           enabled: rule.enabled
           hoverEnabled: true
           cursorShape: Qt.PointingHandCursor
-          onClicked: rule.picking = !rule.picking
+          onClicked: rule.toggled()
         }
       }
 
@@ -151,7 +154,7 @@ Column {
       opacity: rule.picking ? 1 : 0
       Behavior on opacity { NumberAnimation { duration: Style.duration(rule.picking ? 160 : 120); easing.type: Easing.OutCubic } }
       foreground: rule.foreground; accent: rule.accent; fontFamily: rule.fontFamily
-      onChanged: function(v) { rule.picking = false; rule.picked(v) }
+      onChanged: function(v) { rule.picked(v) }
     }
   }
 }

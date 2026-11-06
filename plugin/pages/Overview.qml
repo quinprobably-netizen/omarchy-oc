@@ -6,7 +6,7 @@ import "../Model.js" as Model
 import "../components"
 
 // Overview page: profile chips, the automation line, live tiles with
-// sparklines, and the pending/alert banners.
+// sparklines, and the alert banner.
 Column {
   id: page
 
@@ -90,60 +90,7 @@ Column {
     font.pixelSize: Style.font.bodySmall
   }
 
-  // ---- pending: Keep / Revert ----
-  Rectangle {
-    id: pendingBanner
-    visible: page.root.pending !== null
-    width: parent.width
-    implicitHeight: pendingRow.implicitHeight + Style.space(16)
-    radius: Style.cornerRadius
-    color: Qt.rgba(page.accent.r, page.accent.g, page.accent.b, 0.14)
-    border.width: 1
-    border.color: Qt.rgba(page.accent.r, page.accent.g, page.accent.b, 0.5)
-
-    Row {
-      id: pendingRow
-      anchors.verticalCenter: parent.verticalCenter
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.margins: Style.space(8)
-      spacing: Style.space(8)
-
-      Text {
-        width: parent.width - keepButton.width - revertButton.width - parent.spacing * 2
-        anchors.verticalCenter: parent.verticalCenter
-        wrapMode: Text.Wrap
-        textFormat: Text.PlainText
-        text: page.root.pending
-          ? page.strings.t("pending.text").arg(Model.profileLabel(page.root.pending.profile)).arg(Model.pendingRemaining(page.st))
-          : ""
-        color: page.fg
-        font.family: page.fontFamily
-        font.pixelSize: Style.font.bodySmall
-      }
-      Button {
-        id: keepButton
-        anchors.verticalCenter: parent.verticalCenter
-        text: page.strings.t("pending.keep")
-        fontSize: Style.font.caption
-        foreground: page.fg
-        fontFamily: page.fontFamily
-        bordered: true
-        selected: true
-        onClicked: page.root.keep()
-      }
-      Button {
-        id: revertButton
-        anchors.verticalCenter: parent.verticalCenter
-        text: page.strings.t("pending.revert")
-        fontSize: Style.font.caption
-        foreground: page.fg
-        fontFamily: page.fontFamily
-        bordered: true
-        onClicked: page.root.revert()
-      }
-    }
-  }
+  // The Keep/Revert window is the PendingBar under every page (Panel.qml).
 
   // ---- alert ----
   Rectangle {

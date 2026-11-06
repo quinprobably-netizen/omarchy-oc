@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -28,8 +29,15 @@ Column {
   readonly property bool autoOn: !!(st && st.auto_switch)
   readonly property var wd: st && st.watchdog ? st.watchdog : null
   readonly property bool wdOn: !!(wd && wd.enabled)
-  readonly property var rules: Auto.ruleRows(st)
-  readonly property var profiles: Auto.profileOptions(st, Model.profileLabel)
+  // Repeater models. Every status tick is a new object, so these are
+  // replaced only when their content changes (Auto.listChanged); otherwise
+  // the Repeaters would rebuild their delegates every second.
+  property var rules: []
+  property var profiles: []
+  property var matchers: []
+  // The rule whose profile picker is open (−1: none). Page state, not
+  // delegate state, so it survives a rebuilt delegate.
+  property int pickingIndex: -1
   readonly property string caption: {
     if (!st) return strings.t("overview.offline")
     if (st.auto_switch && st.auto_profile) return strings.t("auto.caption.on").arg(Model.plain(Model.profileLabel(st.auto_profile)))
@@ -42,11 +50,41 @@ Column {
   property var procs: null
   property bool procsLoading: false
   property bool procsFailed: false
-  readonly property var matchers: Auto.matcherOptions(procs, st ? st.rules : null)
+  onProcsChanged: refreshMatchers()
 
   // ---- watchdog steppers: edits overlay the status until it catches up ----
   property var wdEdits: ({})
-  onStChanged: wdEdits = Auto.watchdogSettled(wdEdits, wd)
+
+  onStChanged: {
+    wdEdits = Auto.watchdogSettled(wdEdits, wd)
+    var nextRules = Auto.ruleRows(st)
+    if (Auto.listChanged(rules, nextRules)) {
+      rules = nextRules
+      pickingIndex = -1
+    }
+    var nextProfiles = Auto.profileOptions(st, Model.profileLabel)
+    if (Auto.listChanged(profiles, nextProfiles)) profiles = nextProfiles
+    refreshMatchers()
+  }
+  Component.onCompleted: stChanged()
+
+  function refreshMatchers() {
+    var next = Auto.matcherOptions(procs, st ? st.rules : null)
+    if (Auto.listChanged(matchers, next)) matchers = next
+  }
+
+  function togglePick(index) {
+    pickingIndex = pickingIndex === index ? -1 : index
+  }
+
+  // Scripting hook (and how the live check drives the pickers):
+  //   omarchy-shell qqq.oc.auto pick 0      open rule 0's profile picker
+  //   omarchy-shell qqq.oc.auto add         open the add-rule picker
+  IpcHandler {
+    target: "qqq.oc.auto"
+    function pick(index: int): void { page.pickingIndex = index }
+    function add(): void { page.openAdd() }
+  }
 
   function request(cmd, args, cb) {
     root.client.request(cmd, args, function(ok, r) {
@@ -238,7 +276,9 @@ Column {
       profiles: page.profiles
       removeTooltip: page.strings.t("auto.rule.remove")
       foreground: page.fg; accent: page.accent; urgent: page.urgent; fontFamily: page.fontFamily
-      onPicked: function(p) { page.request("rule-set", { index: modelData.index, profile: p }) }
+      picking: page.pickingIndex === modelData.index
+      onToggled: page.togglePick(modelData.index)
+      onPicked: function(p) { page.pickingIndex = -1; page.request("rule-set", { index: modelData.index, profile: p }) }
       onRemoved: page.request("rule-del", { index: modelData.index })
     }
   }

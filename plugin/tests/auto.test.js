@@ -105,6 +105,19 @@ test("profileOptions lists the daemon's profiles with their short labels", () =>
   assert.deepEqual(A.profileOptions({ profiles: [{ name: "<i>" }] }, M.profileLabel), [{ value: "<i>", label: "‹i›" }])
 })
 
+test("listChanged: a Repeater model is replaced only when its content differs", () => {
+  const a = A.ruleRows(status)
+  const b = A.ruleRows({ ...status, rules: status.rules.map(r => ({ ...r })) })
+  assert.notEqual(a, b, "fresh arrays from a fresh status object")
+  assert.equal(A.listChanged(a, b), false, "same content: keep the old array (and its delegates)")
+  assert.equal(A.listChanged(a, A.ruleRows({ rules: status.rules.slice(0, 2) })), true)
+  assert.equal(A.listChanged(a, A.ruleRows({ ...status, rules: [status.rules[0], { matcher: "gamemode", profile: "max" }, status.rules[2]] })), true)
+  assert.equal(A.listChanged([], []), false)
+  assert.equal(A.listChanged(null, []), true)
+  assert.equal(A.listChanged(undefined, undefined), false)
+  assert.equal(A.listChanged([{ a: 1 }], [{ a: "1" }]), true)
+})
+
 test("the Auto page is wired into the rail", () => {
   assert.equal(M.pageSource("auto"), "pages/Auto.qml")
 })

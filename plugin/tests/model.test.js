@@ -141,6 +141,15 @@ test("reconnect schedules the retry 2 s out", () => {
   assert.equal(M.reconnect(null, 500).retryAt, 2500)
 })
 
+test("pendingInfo: what the Keep/Revert bar shows, null when nothing is pending", () => {
+  assert.equal(M.pendingInfo(status), null)
+  assert.equal(M.pendingInfo(null), null)
+  const p = M.pendingInfo({ ...status, pending: { profile: "custom", previous: "stock", remaining: 14.6 } })
+  assert.deepEqual(p, { profile: "custom", label: "custom", remaining: 15 })
+  assert.deepEqual(M.pendingInfo({ ...status, pending: { profile: "max", remaining: -2 } }), { profile: "max", label: "Max", remaining: 0 })
+  assert.equal(M.pendingInfo({ ...status, pending: { profile: "<b>x</b>", remaining: 3 } }).label, "‹b›x‹/b›", "neutralised for the bar")
+})
+
 test("barLabel", () => {
   assert.equal(M.barLabel({ ...status, pending: { profile: "custom", previous: "stock", remaining: 14 } }, true, "Temps"), "KEEP 14s")
   assert.equal(M.barLabel(status, false, "Temps"), "OC offline")

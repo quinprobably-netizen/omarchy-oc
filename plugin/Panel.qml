@@ -255,7 +255,8 @@ Panel {
           onSelected: function(name) { root.cursorActive = false; root.showPage(name) }
         }
 
-        // The page, with the stage bar under it on every page.
+        // The page, with the Keep/Revert bar and the stage bar under it on
+        // every page.
         Column {
           width: body.width - rail.width - body.spacing
           spacing: Style.space(10)
@@ -267,6 +268,13 @@ Panel {
             onSrcChanged: load()
             Component.onCompleted: load()
             function load() { setSource(Qt.resolvedUrl(src), { root: root }) }
+          }
+
+          PendingBar {
+            width: parent.width
+            root: root
+            onKeep: root.keep()
+            onRevert: root.revert()
           }
 
           StageBar {

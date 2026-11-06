@@ -69,6 +69,16 @@ function matcherOptions(procs, rules) {
   return out
 }
 
+// A Repeater's model must keep its identity across status ticks (every
+// tick is a new status object, so the derived arrays are new too), or it
+// rebuilds its delegates each second and loses whatever they hold. The
+// page replaces a list only when this says the content changed.
+function listChanged(prev, next) {
+  if (prev === next) return false
+  if (!prev || !next) return true
+  return JSON.stringify(prev) !== JSON.stringify(next)
+}
+
 // ---- Keep/Revert window ---------------------------------------------------
 
 function confirmValue(st) {
@@ -147,7 +157,7 @@ function profileOptions(st, label) {
 if (typeof module !== "undefined") {
   module.exports = {
     NAME_MAX: NAME_MAX, CONFIRM_OPTIONS: CONFIRM_OPTIONS, WATCHDOG_BOUNDS: WATCHDOG_BOUNDS, BUILTIN_MATCHERS: BUILTIN_MATCHERS,
-    ruleLabel: ruleLabel, ruleRows: ruleRows, matcherOptions: matcherOptions,
+    ruleLabel: ruleLabel, ruleRows: ruleRows, matcherOptions: matcherOptions, listChanged: listChanged,
     confirmValue: confirmValue, confirmSeconds: confirmSeconds,
     watchdogLine: watchdogLine, watchdogClamp: watchdogClamp, watchdogShown: watchdogShown, watchdogSettled: watchdogSettled,
     profileOptions: profileOptions
