@@ -179,6 +179,14 @@ function pendingRemaining(st) {
   return st && st.pending ? Math.max(0, Math.round(Number(st.pending.remaining) || 0)) : -1
 }
 
+// What the Keep/Revert bar under every page shows, or null while nothing
+// is pending. The label is neutralised: it names a user profile.
+function pendingInfo(st) {
+  if (!st || !st.pending) return null
+  var name = String(st.pending.profile || "")
+  return { profile: name, label: plain(profileLabel(name)), remaining: pendingRemaining(st) }
+}
+
 function profileEntry(st, name) {
   if (!st || !st.profiles) return null
   for (var i = 0; i < st.profiles.length; i++) if (st.profiles[i].name === name) return st.profiles[i]
@@ -522,7 +530,7 @@ if (typeof module !== "undefined") {
     splitEdit: splitEdit, plain: plain, fmt: fmt, ghz: ghz, gib: gib, suggestCo: suggestCo,
     profileIcon: profileIcon, profileLabel: profileLabel, profileEntry: profileEntry, profileChips: profileChips,
     automationLine: automationLine, series: series, cpuTile: cpuTile, gpuTile: gpuTile, memTile: memTile,
-    fansTile: fansTile, offlineHint: offlineHint, pendingRemaining: pendingRemaining,
+    fansTile: fansTile, offlineHint: offlineHint, pendingRemaining: pendingRemaining, pendingInfo: pendingInfo,
     barLabel: barLabel, tooltip: tooltip, nextFavourite: nextFavourite, reconnect: reconnect,
     takeLive: takeLive, activeProfile: activeProfile, DISCONNECTED: DISCONNECTED, requestError: requestError,
     unstage: unstage, LIMIT_BOUNDS: LIMIT_BOUNDS, limitRow: limitRow, shownLimit: shownLimit, stagedHas: stagedHas,

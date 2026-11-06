@@ -4,7 +4,7 @@
   "page.coming": "Coming in a later task",
   "overview.offline": "Offline",
   "overview.auto": "auto",
-  "pending.text": "Keep %1? It reverts in %2 s.",
+  "pending.bar": "Keep \"%1\"? %2 s",
   "pending.keep": "Keep",
   "pending.revert": "Revert",
   "alert.clear": "Clear",
