@@ -27,7 +27,7 @@ var PAGES = [
   { key: "gpu",      icon: "󰢮", label: "GPU" },                             // 󰢮
   { key: "memory",   icon: "󰘚", label: "Memory" },                          // 󰘚
   { key: "fans",     icon: "󰈐", label: "Fans", file: "Fans.qml" },          // 󰈐
-  { key: "auto",     icon: "󰁪", label: "Auto" },                            // 󰁪
+  { key: "auto",     icon: "󰁪", label: "Auto", file: "Auto.qml" },          // 󰁪
   { key: "test",     icon: "󰙨", label: "Test" }                             // 󰙨
 ]
 

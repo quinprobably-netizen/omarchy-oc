@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{Fake, r};
+use common::{Fake, r, w};
 use omarchy_oc::daemon::Core;
 use serde_json::{Value, json};
 
@@ -247,4 +247,39 @@ fn edit_risky_key_resets_confirmed() {
     let res = call(&mut c, json!({"cmd": "edit", "profile": "my-max", "changes": {"gpu.power_w": 140}})).unwrap();
     assert_eq!(res["pending"], json!(true), "{res}");
     assert_eq!(profile_status(&c, "my-max")["confirmed"], json!(false));
+}
+
+#[test]
+fn processes_lists_unique_names() {
+    let f = Fake::new("procs");
+    // Two bash, one blender, one kernel thread (empty cmdline); the fake's
+    // non-numeric /proc entries (cpuinfo, stat, sys) are skipped too.
+    for (pid, comm, cmd) in [("300", "bash", "/usr/bin/bash\0-l\0"), ("200", "blender", "/usr/bin/blender\0"), ("100", "bash", "bash\0")] {
+        w(&f.root, &format!("/proc/{pid}/comm"), comm);
+        w(&f.root, &format!("/proc/{pid}/cmdline"), cmd);
+    }
+    w(&f.root, "/proc/2/comm", "kthreadd");
+    w(&f.root, "/proc/2/cmdline", "");
+    let mut c = f.core();
+    let res = call(&mut c, json!({"cmd": "processes"})).unwrap();
+    assert_eq!(res, json!([{"name": "bash"}, {"name": "blender"}]), "{res}");
+}
+
+#[test]
+fn rule_set_changes_profile_in_place() {
+    let f = Fake::new("rule-set");
+    let mut c = f.core();
+    call(&mut c, json!({"cmd": "rule-add", "matcher": "steam-game", "profile": "max"})).unwrap();
+    call(&mut c, json!({"cmd": "rule-add", "matcher": "process:blender", "profile": "balanced"})).unwrap();
+    let res = call(&mut c, json!({"cmd": "rule-set", "index": 0, "profile": "performance"})).unwrap();
+    assert_eq!(
+        res["rules"],
+        json!([{"matcher": "steam-game", "profile": "performance"}, {"matcher": "process:blender", "profile": "balanced"}]),
+        "order kept, only the profile changes: {res}"
+    );
+    assert!(call(&mut c, json!({"cmd": "rule-set", "index": 2, "profile": "max"})).is_err(), "no such rule");
+    assert!(call(&mut c, json!({"cmd": "rule-set", "index": 0, "profile": "nope"})).is_err(), "unknown profile");
+    assert!(call(&mut c, json!({"cmd": "rule-set", "profile": "max"})).is_err(), "missing index");
+    let st = c.status(1);
+    assert_eq!(st["rules"][0]["profile"], json!("performance"));
 }
