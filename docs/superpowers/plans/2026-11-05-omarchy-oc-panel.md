@@ -202,7 +202,7 @@
 - [ ] **Step 6: Live check against a user-mode daemon.**
   - Start `target/release/omarchy-ocd run --run-dir $d/run --state-dir $d/state --group qqq --kmsg /dev/null`, which has real readings and fails writes.
   - Run `./install.sh --plugin`, then set `socketPath` to `$d/run/control.sock` with `omarchy plugin` settings or in shell.json.
-  - Run `omarchy restart shell`, then `omarchy-shell qqq.oc open`, then `grim -o HDMI-A-1 /tmp/claude-1000/-home-qqq/e774ceeb-d607-46ca-b191-176e8f0ce0a8/scratchpad/oc-overview.png`.
+  - Run `omarchy restart shell`, then `omarchy-shell qqq.oc open`, then `grim -o HDMI-A-1 /tmp/oc-overview.png`.
   - Expected: the screenshot shows the rail and live Overview tiles with numbers.
   - Kill the daemon: the panel shows offline. Restart it: back within 2 s.
 - [ ] **Step 7: Commit.** `git add plugin install.sh && git commit -m "qqq.oc: socket client, model, bar widget, rail and Overview"`
