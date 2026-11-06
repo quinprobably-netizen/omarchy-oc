@@ -30,6 +30,9 @@ Column {
   property bool polled: false
   property bool polling: false
   property bool refreshAgain: false
+  // `statusError` belongs to the status poll, `fansError` to the last
+  // command: a rejected command stays on screen until the next one succeeds.
+  property string statusError: ""
   property string fansError: ""
 
   readonly property bool fansAlive: alive && fst !== null
@@ -72,10 +75,10 @@ Column {
       page.polled = true
       if (ok && r && typeof r === "object" && Array.isArray(r.fans)) {
         page.fst = r
-        page.fansError = ""
+        page.statusError = ""
       } else {
         page.fst = null
-        page.fansError = Model.requestError(ok, r)
+        page.statusError = Model.requestError(ok, r)
       }
       if (page.refreshAgain) { page.refreshAgain = false; page.refresh() }
     })
@@ -84,6 +87,8 @@ Column {
   // Commands go out one at a time, in order, so a fast series of curve
   // edits lands on omarchy-fand in the order it was made. Each reply is
   // followed by a status refresh, which also resolves the editor's draft.
+  // Calibrate and re-test reply at once too (omarchy-fand runs them on a
+  // thread and reports progress in its status), so they take the same queue.
   property var queue: []
   property bool busy: false
 
@@ -103,16 +108,6 @@ Column {
       page.fansError = Model.requestError(ok, r)
       page.refresh()
       page.pump()
-    })
-  }
-
-  // Calibrate and re-test reply only when they finish (minutes); omarchy-fand
-  // reports progress in its status meanwhile, so they skip the queue.
-  function sendLong(req) {
-    root.client.request("fans", { req: req }, function(ok, r) {
-      if (!page) return
-      page.fansError = Model.requestError(ok, r)
-      page.refresh()
     })
   }
 
@@ -137,11 +132,11 @@ Column {
       return
     }
     confirmCalibrate = false
-    sendLong({ cmd: "calibrate" })
+    send({ cmd: "calibrate" })
   }
 
   function retest(fanId) {
-    sendLong({ cmd: "retest", fans: [String(fanId)] })
+    send({ cmd: "retest", fans: [String(fanId)] })
   }
 
   Timer { id: confirmTimer; interval: 4000; onTriggered: page.confirmCalibrate = false }
@@ -248,7 +243,7 @@ Column {
     width: parent.width
     wrapMode: Text.Wrap
     textFormat: Text.PlainText
-    text: page.strings.t("fans.offline") + (page.fansError !== "" ? "\n" + page.fansError : "")
+    text: page.strings.t("fans.offline") + (page.statusError !== "" ? "\n" + page.statusError : "")
     color: page.dim
     font.family: page.fontFamily
     font.pixelSize: Style.font.bodySmall
