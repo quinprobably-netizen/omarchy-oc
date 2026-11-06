@@ -30,6 +30,8 @@ Grid {
   columns: perRow
   columnSpacing: Style.space(5)
   rowSpacing: Style.space(5)
+  // Disabled (no SMU): dimmed like the other controls, not just deaf.
+  opacity: enabled ? 1 : 0.45
   readonly property real cell: (width - columnSpacing * (columns - 1)) / columns
 
   Repeater {
