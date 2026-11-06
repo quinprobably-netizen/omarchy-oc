@@ -463,3 +463,76 @@ fn test_gpu_and_per_core_commands() {
     let r = c.recv().unwrap();
     assert_eq!(r["ok"], json!(false), "{r}");
 }
+
+#[test]
+fn test_blocks_apply_and_applying_edits() {
+    let d = Daemon::start("test-blocks");
+    d.fake.tester("omarchy-oc", SCRIPT_WAITS);
+    let mut c = d.connect();
+    // Test on the user profile "custom"; "other" stays inactive.
+    c.send(json!({"id": 1, "cmd": "copy", "from": "performance", "to": "other"}));
+    c.recv_ok();
+    c.send(json!({"id": 1, "cmd": "apply", "profile": "custom"}));
+    c.recv_ok();
+    subscribe(&mut c);
+    c.send(json!({"id": 2, "cmd": "test-start", "kind": "cpu", "seconds": 60}));
+    c.recv_ok();
+    let refused = |c: &mut Conn, id: u64, mut req: Value| {
+        req["id"] = json!(id);
+        c.send(req);
+        let r = c.recv().unwrap();
+        assert_eq!(r["ok"], json!(false), "{r}");
+        assert!(r["error"].as_str().unwrap().contains("stop the test first"), "{r}");
+    };
+    // The verdict is recorded against the profile the test started on, so
+    // nothing may change the hardware under it.
+    refused(&mut c, 3, json!({"cmd": "apply", "profile": "performance"}));
+    refused(&mut c, 4, json!({"cmd": "edit", "profile": "other", "changes": {"cpu.epp": "power"}, "apply": true}));
+    refused(&mut c, 5, json!({"cmd": "edit", "profile": "custom", "changes": {"cpu.epp": "power"}})); // active
+    refused(&mut c, 6, json!({"cmd": "edit", "profile": "stock", "changes": {"cpu.epp": "power"}})); // forks into the active custom
+    refused(&mut c, 7, json!({"cmd": "set", "profile": "custom", "key": "cpu.epp", "value": "power"}));
+    assert_eq!(d.core.lock().unwrap().cfg.profiles["custom"].cpu.epp, None, "nothing saved either");
+    // A safe edit of an inactive profile changes nothing on the hardware.
+    c.send(json!({"id": 8, "cmd": "edit", "profile": "other", "changes": {"gpu.max_mhz": 2000}}));
+    let r = c.recv_ok();
+    assert_eq!(r["result"]["applied"], json!(false), "{r}");
+    assert_eq!(d.core.lock().unwrap().active, "custom");
+    c.send(json!({"id": 9, "cmd": "test-stop"}));
+    c.recv_ok();
+    d.events_until(&mut c, "test-done", Duration::from_secs(10));
+    c.send(json!({"id": 10, "cmd": "apply", "profile": "performance"}));
+    assert_eq!(c.recv_ok()["result"]["profile"], json!("performance"));
+}
+
+#[test]
+fn watchdog_fallback_during_test_fails_it() {
+    let d = Daemon::start("test-watchdog");
+    d.fake.tester("omarchy-oc", SCRIPT_WAITS);
+    let mut c = d.connect();
+    c.send(json!({"id": 1, "cmd": "apply", "profile": "performance"}));
+    c.recv_ok();
+    c.send(json!({"id": 2, "cmd": "watchdog", "gpu_max_c": 60, "seconds": 1}));
+    c.recv_ok();
+    subscribe(&mut c);
+    c.send(json!({"id": 3, "cmd": "test-start", "kind": "cpu", "seconds": 60}));
+    c.recv_ok();
+    d.events_until(&mut c, "test-progress", Duration::from_secs(10));
+    // The GPU overheats under test: safety beats the test bookkeeping.
+    common::w(&d.fake.root, "/sys/devices/pci0000:00/0000:00:01.1/0000:03:00.0/hwmon/hwmon2/temp2_input", "70000");
+    // The same tick also pushes the watchdog alert.
+    let evs = d.events_until(&mut c, "test-done", Duration::from_secs(10));
+    assert!(evs.iter().any(|e| e["event"] == json!("alert")), "{evs:?}");
+    let done = evs.iter().find(|e| e["event"] == json!("test-done")).unwrap();
+    assert_eq!(done["passed"], json!(false), "{done}");
+    assert_eq!(done["recorded"], json!(true), "{done}");
+    assert_eq!(done["profile"], json!("performance"), "{done}");
+    assert!(done["detail"].as_str().unwrap().to_lowercase().contains("watchdog"), "{done}");
+    let core = d.core.lock().unwrap();
+    assert_eq!(core.active, "stock", "the watchdog still switched");
+    drop(core);
+    let p = d.profile("performance");
+    assert_eq!(p["cpu_test"]["passed"], json!(false), "{p}");
+    assert!(p["cpu_test"]["detail"].as_str().unwrap().to_lowercase().contains("watchdog"), "{p}");
+    assert_eq!(d.core.lock().unwrap().status(1)["stress"], Value::Null);
+    assert!(!d.dirty());
+}

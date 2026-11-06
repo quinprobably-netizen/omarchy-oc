@@ -499,6 +499,16 @@ impl Core {
             self.auto_blocked = Some(a);
         }
         let prev = self.active.clone();
+        // Safety beats the test: a run the watchdog had to cut short is a
+        // failed verdict for the profile it ran on.
+        if let Some(st) = &self.stress {
+            let kind = st.kind.clone();
+            if let Some(mut t) = self.test.take() {
+                t.stop();
+            }
+            let r = json!({"passed": false, "errors": 0, "detail": format!("watchdog stepped in: {reason}"), "completed": true});
+            self.finish_test(&kind, r, false);
+        }
         let _ = self.apply_profile(&fb, Origin::Watchdog);
         self.set_alert(format!("Watchdog: {reason}. Switched from \"{prev}\" to \"{fb}\"."));
         self.message = self.alert.clone().unwrap_or_default();
@@ -860,7 +870,14 @@ impl Core {
             }
         });
         let r = json!({"passed": passed, "errors": errors, "seconds": fin["t"], "detail": detail, "completed": completed});
-        let ev = match self.record_test(&kind, &r) {
+        self.finish_test(&kind, r, interrupted);
+    }
+
+    /// Record a test's verdict `r` (the `record_test` shape) and push
+    /// `test-done`.
+    fn finish_test(&mut self, kind: &str, r: Value, interrupted: bool) {
+        let errors = r["errors"].as_u64().unwrap_or(0);
+        let ev = match self.record_test(kind, &r) {
             Ok(v) => {
                 let recorded = v["recorded"] == json!(true);
                 let res = &v["result"];
@@ -881,6 +898,15 @@ impl Core {
         self.push_event(ev);
     }
 
+    /// Nothing may change the hardware under a running test: its verdict
+    /// belongs to the settings it started on.
+    fn no_test_running(&self) -> Result<(), String> {
+        match &self.stress {
+            Some(st) => Err(format!("stop the test first (a {} stability test is running)", st.kind)),
+            None => Ok(()),
+        }
+    }
+
     // ---- requests ------------------------------------------------------------
 
     pub fn handle(&mut self, req: &Value) -> Result<Value, String> {
@@ -898,6 +924,7 @@ impl Core {
             }
             "apply" => {
                 let p = name_arg("profile")?;
+                self.no_test_running()?;
                 self.apply_profile(&p, Origin::User)
             }
             "confirm" => self.confirm(),
@@ -911,6 +938,9 @@ impl Core {
                 }
                 let mut t = self.cfg.profiles.get(&p).cloned().ok_or_else(|| format!("no profile named \"{p}\""))?;
                 t.set_key(&key, &val)?;
+                if self.active == p {
+                    self.no_test_running()?;
+                }
                 self.cfg.profiles.insert(p.clone(), t);
                 self.save_cfg();
                 self.reapply_if_active(&p)
@@ -934,9 +964,13 @@ impl Core {
                 }
                 let forked = Config::is_builtin(&p);
                 let target = if forked { "custom".to_string() } else { p };
+                let applies = forked || !risky.is_empty() || self.active == target;
+                if apply || applies {
+                    self.no_test_running()?;
+                }
                 self.cfg.profiles.insert(target.clone(), t);
                 self.save_cfg();
-                if forked || !risky.is_empty() || self.active == target {
+                if applies {
                     self.apply_profile(&target, Origin::User)
                 } else {
                     Ok(json!({
@@ -955,6 +989,9 @@ impl Core {
                 }
                 let t: Tune = serde_json::from_value(req.get("tune").cloned().unwrap_or_default()).map_err(|e| format!("tune: {e}"))?;
                 t.validate()?;
+                if self.active == p {
+                    self.no_test_running()?;
+                }
                 self.cfg.profiles.insert(p.clone(), t);
                 self.save_cfg();
                 self.reapply_if_active(&p)
@@ -1151,7 +1188,12 @@ impl Core {
     }
 
     fn reapply_if_active(&mut self, p: &str) -> Result<Value, String> {
-        if self.active == p { self.apply_profile(p, Origin::User) } else { Ok(json!({"profile": p, "applied": false})) }
+        if self.active == p {
+            self.no_test_running()?;
+            self.apply_profile(p, Origin::User)
+        } else {
+            Ok(json!({"profile": p, "applied": false}))
+        }
     }
 }
 
