@@ -258,7 +258,9 @@ function cpuTile(st) {
   }
 }
 
-function gpuTile(st) {
+// xe reports act_mhz 0 while the GT sleeps in rc6: the tile reads
+// `idleText` then, and its sparkline draws such samples as gaps (gapZero).
+function gpuTile(st, idleText) {
   var g = st ? st.gpu : null
   var r = g ? g.reading : null
   var sub = ""
@@ -270,12 +272,24 @@ function gpuTile(st) {
       sub += " · " + fmt(w, 0) + (lim !== null ? " of " + fmt(lim, 0) : "") + " W"
     }
   }
+  var mhz = r ? num(r.act_mhz) : null
+  var idle = mhz === 0
   return {
     title: "GPU" + (g && g.name ? " · " + g.name : ""),
-    value: r && num(r.act_mhz) !== null ? fmt(r.act_mhz, 0, " MHz") : "—",
+    value: idle ? (idleText || "idle") : mhz !== null ? fmt(mhz, 0, " MHz") : "—",
     sub: sub,
-    seriesName: "gpu_mhz"
+    idle: idle,
+    seriesName: "gpu_mhz",
+    gapZero: true
   }
+}
+
+// A tile's sparkline samples; zeros become gaps for a tile that asks (the
+// GPU clock, where 0 means asleep, not slow).
+function tileSeries(st, tile) {
+  var vals = series(st, tile ? tile.seriesName : "")
+  if (!tile || !tile.gapZero) return vals
+  return vals.map(function(v) { return v === 0 ? NaN : v })
 }
 
 function memTile(st) {
@@ -469,6 +483,19 @@ function smuDisabledReason(st) {
   return e ? plain(e) : "SMU unavailable"
 }
 
+// The warning above the limit sliders. `noStock`: the SMU answers but the
+// PM table does not read (CONFIG_STRICT_DEVMEM blocks /dev/mem), so the
+// daemon has no stock STAPM/PPT/Tctl/TDC/EDC values and a changed limit
+// stays until a reboot (the Curve Optimizer is unaffected: stock is 0).
+// `reboot`: the fields the daemon could not put back, comma-joined, or "".
+function smuStockNotice(st) {
+  var caps = st && st.caps ? st.caps : null
+  var noStock = !!(caps && caps.smu && !caps.pm_table)
+  var list = st && st.smu && st.smu.needs_reboot ? st.smu.needs_reboot : []
+  var reboot = list.map(function(f) { return plain(f) }).join(", ")
+  return { noStock: noStock, reboot: reboot }
+}
+
 // ---- bar ------------------------------------------------------------------
 
 function barLabel(st, alive, mode) {
@@ -605,6 +632,6 @@ if (typeof module !== "undefined") {
     unstage: unstage, retarget: retarget, applyRequest: applyRequest, LIMIT_BOUNDS: LIMIT_BOUNDS, limitRow: limitRow, shownLimit: shownLimit, stagedHas: stagedHas,
     coAll: coAll, coreTiles: coreTiles, tierLabel: tierLabel, idleMax: idleMax, cpuHeadline: cpuHeadline,
     smuDisabledReason: smuDisabledReason, fmtCo: fmtCo, edcFor: edcFor, EPP_OPTIONS: EPP_OPTIONS,
-    ipcValue: ipcValue
+    ipcValue: ipcValue, smuStockNotice: smuStockNotice, tileSeries: tileSeries
   }
 }

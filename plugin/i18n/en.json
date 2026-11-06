@@ -24,6 +24,8 @@
   "cpu.limits": "Power limits (SMU)",
   "cpu.limits.use": "live use under each bar",
   "cpu.limits.unavailable": "unavailable",
+  "cpu.limits.nostock": "Stock limits can't be read on this kernel — a changed limit stays until you reboot.",
+  "cpu.limits.reboot": "Reboot to restore stock: %1",
   "cpu.ppt_fast": "PPT fast",
   "cpu.ppt_slow": "PPT slow",
   "cpu.tctl": "Temp limit",

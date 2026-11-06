@@ -29,6 +29,7 @@ Column {
   readonly property var smu: st ? st.smu : null
   readonly property string smuReason: Model.smuDisabledReason(st)
   readonly property bool smuOk: smuReason === ""
+  readonly property var stockNotice: Model.smuStockNotice(st)
   readonly property var head: Model.cpuHeadline(st)
   readonly property var tiles: Model.coreTiles(st, tune, profile ? profile.cpu_test : null, stagedChanges)
   readonly property bool hasDense: !!(knobs && knobs.has_dense)
@@ -229,6 +230,30 @@ Column {
     textFormat: Text.PlainText
     text: page.smuReason
     color: page.dim
+    font.family: page.fontFamily
+    font.pixelSize: Style.font.caption
+  }
+
+  // The SMU answers but the PM table does not read: no stock values, so a
+  // changed limit stays until a reboot.
+  Text {
+    visible: page.alive && page.smuOk && page.stockNotice.noStock
+    width: parent.width
+    wrapMode: Text.Wrap
+    textFormat: Text.PlainText
+    text: page.strings.t("cpu.limits.nostock")
+    color: page.urgent
+    font.family: page.fontFamily
+    font.pixelSize: Style.font.caption
+  }
+
+  Text {
+    visible: page.alive && page.stockNotice.reboot !== ""
+    width: parent.width
+    wrapMode: Text.Wrap
+    textFormat: Text.PlainText
+    text: page.strings.t("cpu.limits.reboot").arg(page.stockNotice.reboot)
+    color: page.urgent
     font.family: page.fontFamily
     font.pixelSize: Style.font.caption
   }

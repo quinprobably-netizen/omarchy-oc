@@ -519,3 +519,51 @@ test("default favourites leave out the overclock profile (R23)", () => {
   const panel = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
   assert.match(panel, /setting\("favourites", "eco,balanced,performance"\)/)
 })
+
+// ---- SMU stock warning (post-install) ---------------------------------------
+
+test("smuStockNotice: SMU up but no PM table means no stock values", () => {
+  const noTable = { ...status, caps: { smu: true, pm_table: false, pm_error: "/dev/mem at 0x45e300000: Bad address (os error 14)" } }
+  assert.deepEqual(M.smuStockNotice(noTable), { noStock: true, reboot: "" })
+  // The PM table reads: nothing to warn about.
+  assert.deepEqual(M.smuStockNotice({ ...status, caps: { smu: true, pm_table: true } }), { noStock: false, reboot: "" })
+  // No SMU at all: the sliders are disabled with their own reason, not this one.
+  assert.deepEqual(M.smuStockNotice(status6), { noStock: false, reboot: "" })
+  assert.deepEqual(M.smuStockNotice(null), { noStock: false, reboot: "" })
+  assert.deepEqual(M.smuStockNotice({}), { noStock: false, reboot: "" })
+})
+
+test("smuStockNotice lists the fields only a reboot restores", () => {
+  const st = { ...status, caps: { smu: true, pm_table: false }, smu: { ...status.smu, needs_reboot: ["fast", "tctl"] } }
+  assert.deepEqual(M.smuStockNotice(st), { noStock: true, reboot: "fast, tctl" })
+  // Shown even when the table reads (the SMU may have refused a stock write).
+  const st2 = { ...status, caps: { smu: true, pm_table: true }, smu: { ...status.smu, needs_reboot: ["co[2]"] } }
+  assert.deepEqual(M.smuStockNotice(st2), { noStock: false, reboot: "co[2]" })
+  // Daemon strings are neutralised for a plain-text sink.
+  const st3 = { ...status, caps: { smu: true, pm_table: true }, smu: { ...status.smu, needs_reboot: ["<b>x"] } }
+  assert.equal(M.smuStockNotice(st3).reboot.indexOf("<"), -1)
+  assert.deepEqual(M.smuStockNotice({ ...status, caps: { smu: true, pm_table: true }, smu: null }), { noStock: false, reboot: "" })
+})
+
+// ---- Overview GPU tile at idle ---------------------------------------------
+
+test("gpuTile reads idle while xe reports act_mhz 0 (rc6)", () => {
+  const rc6 = { ...status, gpu: { ...status.gpu, reading: { ...status.gpu.reading, act_mhz: 0 } } }
+  const t = M.gpuTile(rc6, "idle")
+  assert.equal(t.value, "idle")
+  assert.equal(t.idle, true)
+  assert.equal(t.sub, "52° · 141 of 190 W", "the detail line is unchanged")
+  assert.equal(M.gpuTile(rc6).value, "idle", "default text without i18n")
+  const busy = M.gpuTile(status, "idle")
+  assert.equal(busy.value, "2400 MHz")
+  assert.equal(busy.idle, false)
+  assert.equal(M.gpuTile({ ...status, gpu: null }, "idle").idle, false)
+})
+
+test("tileSeries: the GPU sparkline draws 0-MHz samples as gaps, other tiles keep zeros", () => {
+  const st = { ...status, history: { series: { gpu_mhz: [700, 0, 700, null, 0], cpu_mhz: [4000, 0, 4500], fan_cpu: [0, 0, 900] } } }
+  assert.deepEqual(M.tileSeries(st, M.gpuTile(st)), [700, NaN, 700, NaN, NaN])
+  assert.deepEqual(M.tileSeries(st, M.cpuTile(st)), [4000, 0, 4500])
+  assert.deepEqual(M.tileSeries(st, M.fansTile(st)), [0, 0, 900])
+  assert.deepEqual(M.tileSeries(null, M.gpuTile(null)), [])
+})

@@ -2,7 +2,7 @@
 
 Overclocking and tuning for an [Omarchy](https://omarchy.org) desktop, from the bar. Built for this machine: Ryzen 5 8500G (Phoenix 2: 2 Zen 4 + 4 Zen 4c cores), Intel Arc A580 on the `xe` driver, DDR5, Gigabyte B650M D3HP, fans driven by [omarchy-fand](https://github.com/quinprobably-netizen/omarchy-fans). It does what LACT does for this hardware and what LACT cannot: CPU and firmware (SMU) limits, Curve Optimizer, Arc fans, a stability test that catches silent computation errors, and a safety net that puts the machine back to stock when an overclock goes wrong.
 
-**Hardware-verified: pending (see [Verified on this machine](#verified-on-this-machine)).**
+**Hardware-verified 2026-11-05** (see [Verified on this machine](#verified-on-this-machine)); the SMU PM table is not readable on this kernel, so power limits have no live readout or stock value.
 
 - **`omarchy-ocd`**: Rust daemon (root, systemd). Samples everything once a second, applies profiles, serves a Unix control socket, and keeps the machine safe (Keep/Revert, crash guard, watchdog).
 - **`omarchy-oc`**: CLI for scripting, and the CPU stability tester. The panel never uses it.
@@ -12,14 +12,14 @@ Overclocking and tuning for an [Omarchy](https://omarchy.org) desktop, from the 
 Pages:
 
 - **Overview**: profile chips, the automation line, CPU/GPU/Memory/Fans tiles with sparklines, alert and Keep/Revert banners.
-- **CPU**: amd-pstate mode, governor, EPP, boost, SMT, C-state limit, SMU limit sliders (stock tick, live use), Curve Optimizer core grid.
+- **CPU**: amd-pstate mode, governor, EPP, boost, SMT, C-state limit, SMU limit sliders (stock tick and live use where the PM table reads), Curve Optimizer core grid.
 - **GPU**: live chart, PL1 and clock sliders, power profile, the processes using the GPU.
 - **Memory**: usage, DIMM table from SMBIOS and SPD, EXPO/XMP profiles, and the note that timings are BIOS-only.
 - **Fans**: what the `qqq.fans` widget did: fan profiles, RPM list, drag-to-edit curves, calibrate, re-test, hand to BIOS.
 - **Auto**: automation on/off, rules (add from running programs), fallback profile, apply at boot, watchdog, Keep/Revert window length.
 - **Test**: CPU all-core, CPU per-core, GPU; run length, live per-core grid, suggestions for a failing core, history.
 
-Bar widget: left click opens the panel, or keeps pending settings while they count down; right click cycles the favourite profiles (`eco,balanced,max` by default). It turns urgent when the daemon is offline or has an alert. Settings in `~/.config/omarchy/shell.json` (`qqq.oc` entry): `barMode` is `Temps`, `Clocks` or `Icon`; `favourites`; `socketPath`. Shell IPC: `omarchy-shell qqq.oc toggle`, `open`, `page cpu`, `keep`.
+Bar widget: left click opens the panel, or keeps pending settings while they count down; right click cycles the favourite profiles (`eco,balanced,performance` by default). It turns urgent when the daemon is offline or has an alert. Settings in `~/.config/omarchy/shell.json` (`qqq.oc` entry): `barMode` is `Temps`, `Clocks` or `Icon`; `favourites`; `socketPath`. Shell IPC: `omarchy-shell qqq.oc toggle`, `open`, `page cpu`, `keep`.
 
 ## Install
 
@@ -58,7 +58,7 @@ Readings: per-thread MHz and utilisation, Tctl, RAPL package and core watts.
 
 ### SMU firmware limits (`smu.*`, risky: staged behind Apply)
 
-The CPU's power-management firmware, not the kernel. The daemon talks to the SMU mailbox through the SMN index/data pair in the host bridge's PCI config space (`0000:00:00.0`, offsets 0xB8/0xBC), so it needs no kernel module: just root and a kernel that is not locked down. The live limits and their current values come from the PM table, read through `/dev/mem`. Supported: Phoenix, Phoenix 2 and Hawk Point (family 19h, models 0x74, 0x75, 0x78: Ryzen 7040/8040 mobile and 8000G desktop). The protocol is the one [FlyGoat/RyzenAdj](https://github.com/FlyGoat/RyzenAdj) documents, written in Rust from the documentation (no code copied).
+The CPU's power-management firmware, not the kernel. The daemon talks to the SMU mailbox through the SMN index/data pair in the host bridge's PCI config space (`0000:00:00.0`, offsets 0xB8/0xBC), so it needs no kernel module: just root and a kernel that is not locked down. The live limits and their current values come from the PM table, read through `/dev/mem`; on a kernel with `CONFIG_STRICT_DEVMEM` (this machine) that read fails, so the sliders have no live use bar and no stock tick. Supported: Phoenix, Phoenix 2 and Hawk Point (family 19h, models 0x74, 0x75, 0x78: Ryzen 7040/8040 mobile and 8000G desktop). The protocol is the one [FlyGoat/RyzenAdj](https://github.com/FlyGoat/RyzenAdj) documents, written in Rust from the documentation (no code copied).
 
 - `stapm_w`, `fast_w`, `slow_w`: sustained (STAPM), PPT fast and PPT slow power limits, 10–200 W. Stock PPT on this 65 W part is 88 W.
 - `tctl_c`: temperature target, 60–100 °C
@@ -66,7 +66,7 @@ The CPU's power-management firmware, not the kernel. The daemon talks to the SMU
 - `co_all`: Curve Optimizer for every core, −50…30 (negative is an undervolt)
 - `co_cores.<n>`: Curve Optimizer per physical core, applied after `co_all`
 
-Everything set here is volatile: the SMU forgets it on reboot and on suspend (the daemon re-applies after resume). If the SMU is unavailable (no root, lockdown, unsupported CPU) the panel disables these controls and shows why. A limit whose stock value the PM table could not supply can only be restored by a reboot; the daemon says so (`needs_reboot`).
+Everything set here is volatile: the SMU forgets it on reboot and on suspend (the daemon re-applies after resume). If the SMU is unavailable (no root, lockdown, unsupported CPU) the panel disables these controls and shows why. A limit whose stock value the PM table could not supply can only be restored by a reboot; the daemon says so (`needs_reboot`) and the CPU page warns before you move a slider. The Curve Optimizer always goes back to 0.
 
 ### GPU (`gpu.*`)
 
@@ -97,7 +97,7 @@ Everything the daemon does to the hardware is reversible, and the risky part is 
 - **Only kept overclocks apply by themselves.** A risky profile that was never kept is refused at boot and by automation rules ("apply it by hand and keep it once").
 - **Crash guard.** While a risky profile is unconfirmed or under test the daemon holds a `dirty` marker (profile name + boot id) in `/var/lib/omarchy-oc`; a `running` marker always names the active profile. On start, a `dirty` marker from an earlier boot means the machine died in that state: the profile's crash count goes up, its confirmation is withdrawn, and the daemon starts at stock with an alert. A `running` marker from an earlier boot naming a risky profile counts an unclean shutdown; at two in a row apply-at-boot is switched off. A risky profile that runs 30 minutes without a crash clears its count. A daemon restart within the same boot just carries on.
 - **Watchdog** (on by default). CPU at or above 98 °C or GPU at or above 100 °C for 5 s, or, while a risky profile is active, a machine-check error or a GPU hang/reset in the kernel log (`/dev/kmsg`), switches to the fallback profile (`stock` by default) and raises an alert. A test running at the time is cut short and recorded as failed. `omarchy-oc watchdog [--on|--off] [--cpu-max C] [--gpu-max C] [--seconds N] [--fallback P] [--errors on|off]`.
-- **Stopping the daemon restores stock.** The first write to any sysfs knob snapshots its boot value in `/run/omarchy-oc/original.json`; the SMU's stock limits are saved from the PM table. `ExecStopPost=omarchy-ocd restore` puts everything back however the daemon exits, SIGKILL included.
+- **Stopping the daemon restores stock.** The first write to any sysfs knob snapshots its boot value in `/run/omarchy-oc/original.json`; the SMU's stock limits are saved from the PM table when it reads (not on this kernel: see below). `ExecStopPost=omarchy-ocd restore` puts everything back however the daemon exits, SIGKILL included.
 - **Suspend.** The daemon notices a resume (boot-time clock jumping ahead of monotonic) and re-applies the active profile, since the SMU forgets its limits.
 - **No changes under test.** While a stability test runs, applying, editing, saving or re-applying the active profile is refused ("stop the test first"), and a test cannot start while settings are pending.
 - **Every failed write** is in the apply report and shown next to its control.
@@ -166,13 +166,15 @@ The daemon samples at 1 Hz and keeps one hour of fourteen series (CPU MHz averag
 
 ## Verified on this machine
 
-**Hardware-verified: pending (see Task 10).** The controller fills this in after the real install.
+2026-11-05, Ryzen 5 8500G + Arc A580, kernel 7.4.0-rc1-mainline.
 
-- TODO: `omarchy-oc probe` result: SMU family, `smu: true/false`, PM table (version and limits object) or `pm_error`
-- TODO: apply/revert round trip: `omarchy-oc apply performance` → `scaling_governor` = `performance`; `omarchy-oc apply stock` → stock value
-- TODO: overclock round trip from the panel: CO all −5 staged and applied, Keep/Revert shown in panel and bar, timed-out revert, then Apply + Keep
-- TODO: CPU test result (2 min, all-core): pass/fail, errors, ISA used
-- TODO: GPU test result (1 min, mixed): pass/fail, compute errors, VRAM tested
+- **Install**: `./install.sh` ran clean; `omarchy-ocd.service` active; `qqq.fans` retired, `qqq.oc` in the bar.
+- **`omarchy-oc probe`**: the SMU mailbox answers (Phoenix). The PM table does **not** read: `/dev/mem at 0x45e300000: Bad address`, because `CONFIG_STRICT_DEVMEM` blocks reads of System RAM. So there are no live PPT/TDC/EDC readouts and no SMU stock values: a changed power limit needs a reboot to return to stock (the CPU page says so), while the Curve Optimizer resets to 0 normally. A possible future route is the `ryzen_smu` kernel module, which exposes the PM table.
+- **Apply round trip**: `performance` set the governor, ASPM, the GPU min clock and the fan profile; `stock` restored ASPM and the GPU min clock. The fan profile is intentionally left where it is.
+- The Arc's GPU min clock is also changed by other software (600–800 MHz seen; likely the Level Zero runtime under llama-server), so "stock" for that knob is its value when the daemon started.
+- **Curve Optimizer −5 (all cores)** through the daemon: the firmware accepted `co_all=-5`; unconfirmed, it reverted by itself after 20 s; kept, the CPU stability test (120 s) **passed**: 37 878 AVX-512 blocks, 0 errors; the GPU test (60 s) **passed**: 23 165 iterations, 0 errors, about 415 GB/s VRAM with llama-server idle holding 6.8 GiB; 0 machine checks, 0 GPU hangs; then back to stock.
+- **Memory page** reads SMBIOS as root: 1 of 4 slots, 16 GiB DDR5 TeamGroup UD5-6000 running at 6400 MT/s; no DIMM temperature sensor (SMBus not exposed).
+- **Not yet verified on hardware**: stop/uninstall restores stock (covered by tests; needs `sudo systemctl stop omarchy-ocd`).
 
 ## Files
 

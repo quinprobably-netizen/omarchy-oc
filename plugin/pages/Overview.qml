@@ -23,7 +23,7 @@ Column {
   readonly property string fontFamily: root.fontFamily
 
   readonly property var cpu: Model.cpuTile(st)
-  readonly property var gpu: Model.gpuTile(st)
+  readonly property var gpu: Model.gpuTile(st, strings.t("gpu.idle"))
   readonly property var mem: Model.memTile(st)
   readonly property var fans: Model.fansTile(st)
 
@@ -180,25 +180,25 @@ Column {
     Tile {
       width: grid.cell
       title: page.cpu.title; value: page.cpu.value; sub: page.cpu.sub
-      values: Model.series(page.st, page.cpu.seriesName)
+      values: Model.tileSeries(page.st, page.cpu)
       foreground: page.fg; accent: page.accent; fontFamily: page.fontFamily
     }
     Tile {
       width: grid.cell
       title: page.gpu.title; value: page.gpu.value; sub: page.gpu.sub
-      values: Model.series(page.st, page.gpu.seriesName)
+      values: Model.tileSeries(page.st, page.gpu)
       foreground: page.fg; accent: page.accent; fontFamily: page.fontFamily
     }
     Tile {
       width: grid.cell
       title: page.mem.title; value: page.mem.value; sub: page.mem.sub
-      values: Model.series(page.st, page.mem.seriesName)
+      values: Model.tileSeries(page.st, page.mem)
       foreground: page.fg; accent: page.accent; fontFamily: page.fontFamily
     }
     Tile {
       width: grid.cell
       title: page.fans.title; value: page.fans.value; sub: page.fans.sub
-      values: Model.series(page.st, page.fans.seriesName)
+      values: Model.tileSeries(page.st, page.fans)
       foreground: page.fg; accent: page.accent; fontFamily: page.fontFamily
     }
   }
