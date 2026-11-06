@@ -418,7 +418,7 @@ test("pages", () => {
   assert.equal(M.pageIndex("gpu"), 2)
   assert.equal(M.pageIndex("nope"), 0)
   assert.equal(M.pageSource("overview"), "pages/Overview.qml")
-  assert.equal(M.pageSource("gpu"), "pages/Placeholder.qml")
+  assert.equal(M.pageSource("fans"), "pages/Placeholder.qml")
 })
 
 test("takeLive holds a live batch until there is a profile to send it to", () => {
