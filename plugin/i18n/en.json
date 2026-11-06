@@ -78,6 +78,7 @@
   "page.gpu": "GPU",
   "page.memory": "Memory",
   "gpu.chart": "Clock, temperature and power · last 3 min",
+  "gpu.idle": "idle",
   "gpu.limits": "Limits",
   "gpu.limits.hint": "power above stock waits for Apply",
   "gpu.power": "Power (PL1)",

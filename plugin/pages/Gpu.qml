@@ -35,9 +35,15 @@ Column {
   readonly property var powerRow: Gpu.powerRow(st)
   readonly property var maxRow: Gpu.clockRow(st, "max")
   readonly property var minRow: Gpu.clockRow(st, "min")
+  // The clocks as the daemon will validate them: the unflushed live batch,
+  // then the profile's tune, then the hardware knob. The sliders show
+  // these and clamp against them, so the pair sent is never min > max.
+  readonly property var liveChanges: root.liveChanges
+  readonly property var shownMax: Gpu.shownClock("max", liveChanges, gpuTune, knobs)
+  readonly property var shownMin: Gpu.shownClock("min", liveChanges, gpuTune, knobs)
   readonly property var clients: Gpu.gpuClients(st)
   readonly property string throttle: Gpu.throttleText(st)
-  readonly property var chartSeries: Gpu.chartSeries(st, { clock: String(accent), temp: "#e8c26a", power: "#ff6b8b" })
+  readonly property var chartSeries: Gpu.chartSeries(st, { clock: String(accent), temp: "#e8c26a", power: "#ff6b8b" }, strings.t("gpu.idle"))
 
   // Every control goes through root.edit: safe values live, risky staged.
   function edit(key, value) { root.edit(key, value) }
@@ -179,28 +185,28 @@ Column {
     visible: page.alive && page.hasGpu
     width: parent.width
     label: page.strings.t("gpu.max_clock")
-    value: page.maxRow.value
+    value: page.shownMax
     stock: page.maxRow.stock
     from: page.maxRow.min
     to: page.maxRow.max
     step: 50
     unit: " MHz"
     foreground: page.fg; accent: page.accent; fontFamily: page.fontFamily
-    onMoved: function(v) { page.edit("gpu.max_mhz", Gpu.clampClock("max", v, page.minRow.value, page.maxRow.value)) }
+    onMoved: function(v) { page.edit("gpu.max_mhz", Gpu.clampClockEdit("max", v, page.root.liveChanges, page.gpuTune, page.knobs)) }
   }
 
   LimitSlider {
     visible: page.alive && page.hasGpu
     width: parent.width
     label: page.strings.t("gpu.min_clock")
-    value: page.minRow.value
+    value: page.shownMin
     stock: page.minRow.stock
     from: page.minRow.min
     to: page.minRow.max
     step: 50
     unit: " MHz"
     foreground: page.fg; accent: page.accent; fontFamily: page.fontFamily
-    onMoved: function(v) { page.edit("gpu.min_mhz", Gpu.clampClock("min", v, page.minRow.value, page.maxRow.value)) }
+    onMoved: function(v) { page.edit("gpu.min_mhz", Gpu.clampClockEdit("min", v, page.root.liveChanges, page.gpuTune, page.knobs)) }
   }
 
   // ---- power profile + throttle state ----

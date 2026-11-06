@@ -100,6 +100,29 @@ function clampClock(which, v, minMhz, maxMhz) {
   return n
 }
 
+// The clock the daemon will validate against, which is what the slider
+// shows: a live edit still in the 250 ms batch, then the profile's tune,
+// then the hardware knob (the value the tune falls back to when unset).
+function shownClock(which, liveChanges, tune, k) {
+  var key = which === "max" ? "gpu.max_mhz" : "gpu.min_mhz"
+  var field = which === "max" ? "max_mhz" : "min_mhz"
+  if (liveChanges && Object.prototype.hasOwnProperty.call(liveChanges, key)) {
+    var l = num(liveChanges[key])
+    if (l !== null) return l
+  }
+  var t = tune ? num(tune[field]) : null
+  if (t !== null) return t
+  return k ? num(k[field]) : null
+}
+
+// A clock edit clamped against the other clock as the daemon will see it,
+// so two drags inside one batch (min up to 2000, then max down to 1800)
+// still send a valid pair.
+function clampClockEdit(which, v, liveChanges, tune, k) {
+  var other = shownClock(which === "max" ? "min" : "max", liveChanges, tune, k)
+  return which === "max" ? clampClock("max", v, other, null) : clampClock("min", v, null, other)
+}
+
 // ---- header ---------------------------------------------------------------
 
 // "16.0 GT/s PCIe" -> "4.0"; unknown rates are shown as the rate itself.
@@ -152,14 +175,18 @@ function last(vals) {
 }
 
 // Clock, temperature and power, each on its own scale (0..rp0, 0..100 °C,
-// 0..the PL1 slider's top) so the three lines share one box.
-function chartSeries(st, colors) {
+// 0..the PL1 slider's top) so the three lines share one box. xe reports
+// act_mhz 0 while the GT sleeps in rc6: those samples are gaps, and the
+// legend reads `idleText` when the latest one is such a sample.
+function chartSeries(st, colors, idleText) {
   var k = knobs(st)
   var c = colors || {}
-  var mhz = series(st, "gpu_mhz"), temp = series(st, "gpu_temp"), w = series(st, "gpu_w")
+  var raw = series(st, "gpu_mhz"), temp = series(st, "gpu_temp"), w = series(st, "gpu_w")
+  var mhz = raw.map(function(v) { return v === 0 ? NaN : v })
+  var idle = raw.length > 0 && raw[raw.length - 1] === 0
   var rp0 = k ? num(k.rp0_mhz) : null
   return [
-    { values: mhz, color: c.clock || "#b57bff", label: fmt(last(mhz), 0, " MHz"), min: 0, max: rp0 !== null ? rp0 : CLOCK_BOUNDS[1] },
+    { values: mhz, color: c.clock || "#b57bff", label: idle ? (idleText || "idle") : fmt(last(mhz), 0, " MHz"), min: 0, max: rp0 !== null ? rp0 : CLOCK_BOUNDS[1] },
     { values: temp, color: c.temp || "#e8c26a", label: fmt(last(temp), 0, " °C"), min: 0, max: TEMP_MAX_C },
     { values: w, color: c.power || "#ff6b8b", label: fmt(last(w), 0, " W"), min: 0, max: powerRow(st).max }
   ]
@@ -184,7 +211,7 @@ function throttleText(st) {
 if (typeof module !== "undefined") {
   module.exports = {
     CLIENTS_MAX: CLIENTS_MAX, gpuClients: gpuClients, fmtVram: fmtVram, powerRow: powerRow, clockRow: clockRow,
-    clampClock: clampClock, pcieGen: pcieGen, gpuHeadline: gpuHeadline, chartSeries: chartSeries,
+    clampClock: clampClock, shownClock: shownClock, clampClockEdit: clampClockEdit, pcieGen: pcieGen, gpuHeadline: gpuHeadline, chartSeries: chartSeries,
     profileOptions: profileOptions, throttleText: throttleText
   }
 }
