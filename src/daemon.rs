@@ -1080,6 +1080,28 @@ impl Core {
                 self.save_cfg();
                 Ok(json!({"rules": self.cfg.rules}))
             }
+            "rule-set" => {
+                // Change a rule's profile where it is: first match wins, so
+                // the panel must not have to delete and re-add (reorder) it.
+                let i = req.get("index").and_then(Value::as_u64).ok_or("missing \"index\"")? as usize;
+                let profile = name_arg("profile")?;
+                if !self.cfg.profile_exists(&profile) {
+                    return Err(format!("no profile named \"{profile}\""));
+                }
+                let r = self.cfg.rules.get_mut(i).ok_or("no such rule")?;
+                r.profile = profile;
+                self.save_cfg();
+                Ok(json!({"rules": self.cfg.rules}))
+            }
+            "processes" => {
+                // For the panel's "add a rule" picker: the names of the
+                // running programs (kernel threads skipped), unique, sorted.
+                let mut names: Vec<String> = processes(&self.sys, false).into_iter().map(|p| p.comm).collect();
+                names.sort();
+                names.dedup();
+                names.truncate(200);
+                Ok(Value::Array(names.into_iter().map(|n| json!({"name": n})).collect()))
+            }
             "watchdog" => {
                 let w = &mut self.cfg.watchdog;
                 if let Some(v) = b("enabled") {
