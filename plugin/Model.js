@@ -89,16 +89,31 @@ function emptyStaged() {
   return { profile: "", changes: {} }
 }
 
-// Returns a new staged set with `key` added. Staging for another profile
-// starts over: the stage bar belongs to one profile at a time.
+// Returns a new staged set with `key` added, aimed at `profile`. The staged
+// set follows the active profile (R22): a live edit that forks a built-in
+// into custom must not drop what was staged, so nothing here starts over.
 function stage(staged, profile, key, value) {
-  var out = emptyStaged()
-  out.profile = profile
-  if (staged && staged.profile === profile && staged.changes) {
-    for (var k in staged.changes) out.changes[k] = staged.changes[k]
-  }
+  var out = retarget(staged, profile)
   out.changes[key] = value
   return out
+}
+
+// Returns a copy of the staged set aimed at `profile` (the newly active
+// one, after a fork or a switch); an empty `profile` (offline) keeps the
+// old target.
+function retarget(staged, profile) {
+  var out = emptyStaged()
+  out.profile = staged && staged.profile ? String(staged.profile) : ""
+  if (profile) out.profile = String(profile)
+  if (staged && staged.changes) for (var k in staged.changes) out.changes[k] = staged.changes[k]
+  return out
+}
+
+// The `edit` request Apply sends: the staged keys go to the active profile,
+// the one now holding the edits, not the profile they were staged on.
+function applyRequest(staged, active) {
+  var s = retarget(staged, active)
+  return { profile: s.profile, changes: s.changes, apply: true }
 }
 
 function stagedCount(staged) {
@@ -587,7 +602,7 @@ if (typeof module !== "undefined") {
     barLabel: barLabel, tooltip: tooltip, nextFavourite: nextFavourite, reconnect: reconnect,
     takeLive: takeLive, activeProfile: activeProfile, DISCONNECTED: DISCONNECTED, requestError: requestError,
     addInflight: addInflight, clearInflight: clearInflight, settleInflight: settleInflight, tuneValue: tuneValue,
-    unstage: unstage, LIMIT_BOUNDS: LIMIT_BOUNDS, limitRow: limitRow, shownLimit: shownLimit, stagedHas: stagedHas,
+    unstage: unstage, retarget: retarget, applyRequest: applyRequest, LIMIT_BOUNDS: LIMIT_BOUNDS, limitRow: limitRow, shownLimit: shownLimit, stagedHas: stagedHas,
     coAll: coAll, coreTiles: coreTiles, tierLabel: tierLabel, idleMax: idleMax, cpuHeadline: cpuHeadline,
     smuDisabledReason: smuDisabledReason, fmtCo: fmtCo, edcFor: edcFor, EPP_OPTIONS: EPP_OPTIONS,
     ipcValue: ipcValue

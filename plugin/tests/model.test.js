@@ -77,10 +77,12 @@ test("stageKeepsProfile", () => {
   assert.equal(s.profile, "custom")
   assert.equal(M.stagedCount(s), 2)
   assert.deepEqual(s.changes, { "smu.co_all": -10, "smu.fast_w": 120 })
+  // The staged set follows the active profile (R22): staging against
+  // another one keeps what is there and re-targets it.
   const other = M.stage(s, "other", "smu.tctl_c", 90)
   assert.equal(other.profile, "other")
-  assert.equal(M.stagedCount(other), 1)
-  assert.deepEqual(other.changes, { "smu.tctl_c": 90 })
+  assert.equal(M.stagedCount(other), 3)
+  assert.deepEqual(other.changes, { "smu.co_all": -10, "smu.fast_w": 120, "smu.tctl_c": 90 })
   assert.equal(M.stagedCount(s), 2, "input untouched")
   assert.equal(M.stagedCount(null), 0)
 })
@@ -483,3 +485,27 @@ test("settleInflight drops the keys the active profile's tune now reflects", () 
   // A numeric value sent as a string settles against the number the daemon stores.
   assert.deepEqual(M.settleInflight({ "gpu.min_mhz": "2000" }, st), {})
 })
+
+test("staged changes survive a live fork and apply to the new active profile (R22)", () => {
+  // PPT staged while stock is active.
+  let s = M.stage(M.emptyStaged(), "stock", "smu.fast_w", 90)
+  // A live EPP edit forks stock into custom: status.active becomes custom.
+  s = M.retarget(s, "custom")
+  assert.equal(s.profile, "custom")
+  assert.deepEqual(s.changes, { "smu.fast_w": 90 }, "not dropped")
+  // Staging again keeps both, aimed at custom.
+  s = M.stage(s, "custom", "smu.co_all", -10)
+  assert.equal(s.profile, "custom")
+  assert.deepEqual(s.changes, { "smu.fast_w": 90, "smu.co_all": -10 })
+  // Apply goes to the profile that now holds the edits.
+  assert.deepEqual(M.applyRequest(s, "custom"), { profile: "custom", changes: { "smu.fast_w": 90, "smu.co_all": -10 }, apply: true })
+  // ...even when the staged set still names the profile it was staged on.
+  const stale = M.stage(M.emptyStaged(), "stock", "smu.fast_w", 90)
+  assert.equal(M.applyRequest(stale, "custom").profile, "custom")
+  // Offline (no active profile): the staged set keeps its target.
+  assert.equal(M.retarget(s, "").profile, "custom")
+  assert.equal(M.applyRequest(s, "").profile, "custom")
+  assert.equal(M.retarget(null, "custom").profile, "custom")
+  assert.equal(M.stagedCount(M.retarget(null, "custom")), 0)
+})
+

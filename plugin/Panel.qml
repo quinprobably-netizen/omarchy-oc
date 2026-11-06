@@ -108,6 +108,11 @@ Panel {
     flushLive()
   }
 
+  // The staged set follows the active profile (R22): a live edit that forks
+  // a built-in into custom keeps it, aimed at the fork. Offline ("") keeps
+  // the old target.
+  onActiveChanged: staged = Model.retarget(staged, active)
+
   // Risky keys wait in `staged` until applyStaged() sends them with apply:true.
   function stageEdit(key, value) {
     staged = Model.stage(staged, active, key, value)
@@ -133,8 +138,8 @@ Panel {
 
   function applyStaged() {
     if (Model.stagedCount(staged) === 0) return
-    var s = staged
-    oc.request("edit", { profile: s.profile, changes: s.changes, apply: true }, function(ok, r) {
+    // To the active profile, which holds the edits after a fork.
+    oc.request("edit", Model.applyRequest(staged, root.active), function(ok, r) {
       if (ok) root.discardStaged()
       root.requestDone(ok, r)
     })
