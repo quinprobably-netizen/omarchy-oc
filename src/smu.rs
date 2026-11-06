@@ -32,6 +32,7 @@ const MP1: Mailbox = Mailbox { msg: 0x3B10528, rsp: 0x3B10578, arg: 0x3B10998 };
 const PSMU: Mailbox = Mailbox { msg: 0x3B10A20, rsp: 0x3B10A80, arg: 0x3B10A88 };
 
 pub const RESP_OK: u32 = 0x1;
+pub const RESP_BUSY: u32 = 0xFC;
 
 pub fn resp_name(r: u32) -> &'static str {
     match r {
@@ -169,6 +170,141 @@ fn table_size(version: u32) -> usize {
     }
 }
 
+/// What the daemon needs from the SMU: one MP1 command and the PM table.
+/// [`Smu`] is the real mailbox; the tests put in a fake that fails on cue.
+pub trait SmuIo: Send {
+    /// Send MP1 command `id` with first argument `arg0`; returns the SMU's
+    /// response code (0 on timeout or an SMN access error).
+    fn mp1_raw(&self, id: u32, arg0: u32) -> u32;
+    /// Read the power-metrics table.
+    fn read_table(&self, sys: &Sys) -> Result<PmLimits, String>;
+}
+
+/// One MP1 command. A busy SMU gets one more try after a short pause.
+pub fn mp1(dev: &dyn SmuIo, id: u32, arg0: u32) -> Result<(), String> {
+    let mut r = dev.mp1_raw(id, arg0);
+    if r == RESP_BUSY {
+        std::thread::sleep(Duration::from_millis(20));
+        r = dev.mp1_raw(id, arg0);
+    }
+    if r == RESP_OK { Ok(()) } else { Err(format!("SMU command 0x{id:X}: {}", resp_name(r))) }
+}
+
+/// What [`apply`] did.
+#[derive(Debug, Default)]
+pub struct SmuReport {
+    pub sent: Vec<String>,
+    pub errors: Vec<String>,
+    /// Fields that could not be put back to stock (stock unknown, or the
+    /// SMU kept refusing): only a reboot is sure to restore them.
+    pub needs_reboot: Vec<String>,
+    /// Fields whose command went through: set as asked or back at stock.
+    pub done: Vec<String>,
+    /// What the SMU may now hold away from stock: the fields set, plus any
+    /// whose command failed, so a later stop or restore tries them again.
+    /// (A field whose stock value is unknown is dropped: nothing can
+    /// restore it but a reboot.)
+    pub applied: SmuTune,
+}
+
+/// Send every set field of `t`. For fields set before (in `prev`) but
+/// unset now, send the stock value from `stock` (or 0 for the Curve
+/// Optimizer).
+pub fn apply(dev: &dyn SmuIo, t: &SmuTune, prev: &SmuTune, stock: Option<&PmLimits>) -> SmuReport {
+    let mut rep = SmuReport::default();
+    let st = |f: fn(&PmLimits) -> Option<f32>| stock.and_then(f);
+    let lim = |rep: &mut SmuReport, name: &str, id: u32, want: Option<u32>, was: Option<u32>, stockv: Option<f32>, scale: f32| -> Option<u32> {
+        let arg = match (want, was) {
+            (Some(v), _) => (v as f32 * scale) as u32,
+            (None, Some(_)) => match stockv {
+                Some(s) if s > 0.0 => (s * scale).round() as u32,
+                _ => {
+                    rep.needs_reboot.push(name.to_string());
+                    return None;
+                }
+            },
+            (None, None) => return None,
+        };
+        match mp1(dev, id, arg) {
+            Ok(()) => {
+                rep.sent.push(format!("{name}={arg}"));
+                rep.done.push(name.to_string());
+                want
+            }
+            Err(e) => {
+                rep.errors.push(format!("{name}: {e}"));
+                if want.is_none() {
+                    rep.needs_reboot.push(name.to_string());
+                }
+                want.or(was)
+            }
+        }
+    };
+    rep.applied.stapm_w = lim(&mut rep, "stapm", cmd::STAPM_LIMIT, t.stapm_w, prev.stapm_w, st(|p| p.stapm_limit), 1000.0);
+    rep.applied.fast_w = lim(&mut rep, "fast", cmd::FAST_LIMIT, t.fast_w, prev.fast_w, st(|p| p.fast_limit), 1000.0);
+    rep.applied.slow_w = lim(&mut rep, "slow", cmd::SLOW_LIMIT, t.slow_w, prev.slow_w, st(|p| p.slow_limit), 1000.0);
+    rep.applied.tctl_c = lim(&mut rep, "tctl", cmd::TCTL_TEMP, t.tctl_c, prev.tctl_c, st(|p| p.tctl_limit), 1.0);
+    rep.applied.tdc_a = lim(&mut rep, "tdc", cmd::VRM_CURRENT, t.tdc_a, prev.tdc_a, st(|p| p.tdc_limit), 1000.0);
+    rep.applied.soc_tdc_a = lim(&mut rep, "soc_tdc", cmd::VRMSOC_CURRENT, t.soc_tdc_a, prev.soc_tdc_a, st(|p| p.soc_tdc_limit), 1000.0);
+    rep.applied.edc_a = lim(&mut rep, "edc", cmd::VRMMAX_CURRENT, t.edc_a, prev.edc_a, st(|p| p.edc_limit), 1000.0);
+    rep.applied.soc_edc_a = lim(&mut rep, "soc_edc", cmd::VRMSOCMAX_CURRENT, t.soc_edc_a, prev.soc_edc_a, st(|p| p.soc_edc_limit), 1000.0);
+
+    // Curve Optimizer: all-core first, then per-core overrides. Any core
+    // that had a per-core value and no longer does falls back to co_all.
+    rep.applied.co_all = t.co_all;
+    rep.applied.co_cores = t.co_cores.clone();
+    let co_changed = t.co_all != prev.co_all || t.co_cores != prev.co_cores;
+    if co_changed {
+        let all = t.co_all.unwrap_or(0);
+        match mp1(dev, cmd::CO_ALL, co_arg(all)) {
+            Ok(()) => {
+                rep.sent.push(format!("co_all={all}"));
+                rep.done.push("co_all".into());
+            }
+            Err(e) => {
+                rep.errors.push(format!("co_all: {e}"));
+                rep.applied.co_all = t.co_all.or(prev.co_all);
+                if t.co_all.is_none() && prev.co_all.is_some() {
+                    rep.needs_reboot.push("co_all".into());
+                }
+            }
+        }
+        let mut cores: Vec<u32> = t.co_cores.keys().chain(prev.co_cores.keys()).copied().collect();
+        cores.sort();
+        cores.dedup();
+        for core in cores {
+            let v = t.co_cores.get(&core).copied().unwrap_or(all);
+            let name = format!("co[{core}]");
+            match mp1(dev, cmd::CO_PER_CORE, co_core_arg(core, v)) {
+                Ok(()) => {
+                    rep.sent.push(format!("{name}={v}"));
+                    rep.done.push(name);
+                }
+                Err(e) => {
+                    rep.errors.push(format!("{name}: {e}"));
+                    if let Some(x) = t.co_cores.get(&core).or(prev.co_cores.get(&core)) {
+                        rep.applied.co_cores.insert(core, *x);
+                    }
+                    if !t.co_cores.contains_key(&core) && t.co_all.is_none() {
+                        rep.needs_reboot.push(name);
+                    }
+                }
+            }
+        }
+    }
+    rep
+}
+
+impl SmuIo for Smu {
+    fn mp1_raw(&self, id: u32, arg0: u32) -> u32 {
+        self.send(MP1, id, [arg0, 0, 0, 0, 0, 0]).0
+    }
+
+    fn read_table(&self, sys: &Sys) -> Result<PmLimits, String> {
+        Smu::read_table(self, sys)
+    }
+}
+
 impl Smu {
     /// Open the mailbox and check it answers the test message.
     pub fn open(sys: &Sys, family: &str) -> Result<Smu, String> {
@@ -214,11 +350,6 @@ impl Smu {
         go().unwrap_or((0, [0; 6]))
     }
 
-    pub fn mp1(&self, id: u32, arg0: u32) -> Result<(), String> {
-        let (r, _) = self.send(MP1, id, [arg0, 0, 0, 0, 0, 0]);
-        if r == RESP_OK { Ok(()) } else { Err(format!("SMU command 0x{id:X}: {}", resp_name(r))) }
-    }
-
     /// Read the power-metrics table (needs /dev/mem access to the table's
     /// physical address, which is firmware-reserved memory).
     pub fn read_table(&self, sys: &Sys) -> Result<PmLimits, String> {
@@ -251,66 +382,6 @@ impl Smu {
         let mem = File::open(sys.p("/dev/mem")).map_err(|e| format!("/dev/mem: {e}"))?;
         mem.read_exact_at(&mut buf, addr).map_err(|e| format!("/dev/mem at 0x{addr:x}: {e}"))?;
         Ok(PmLimits::parse(version, &buf))
-    }
-
-    /// Send every set field of `t`. For fields set before (in `prev`) but
-    /// unset now, send the stock value from `stock` (or 0 for the Curve
-    /// Optimizer). Returns (sent, errors, needs_reboot) where needs_reboot
-    /// lists limits that could not be restored because stock is unknown.
-    pub fn apply(&self, t: &SmuTune, prev: &SmuTune, stock: Option<&PmLimits>) -> (Vec<String>, Vec<String>, Vec<String>) {
-        let mut sent = Vec::new();
-        let mut errs = Vec::new();
-        let mut reboot = Vec::new();
-        let st = |f: fn(&PmLimits) -> Option<f32>| stock.and_then(f);
-        let mut lim = |name: &str, id: u32, want: Option<u32>, was: Option<u32>, stockv: Option<f32>, scale: f32| {
-            let arg = match (want, was) {
-                (Some(v), _) => Some((v as f32 * scale) as u32),
-                (None, Some(_)) => match stockv {
-                    Some(s) if s > 0.0 => Some((s * scale).round() as u32),
-                    _ => {
-                        reboot.push(name.to_string());
-                        None
-                    }
-                },
-                (None, None) => None,
-            };
-            if let Some(arg) = arg {
-                match self.mp1(id, arg) {
-                    Ok(()) => sent.push(format!("{name}={arg}")),
-                    Err(e) => errs.push(format!("{name}: {e}")),
-                }
-            }
-        };
-        lim("stapm", cmd::STAPM_LIMIT, t.stapm_w, prev.stapm_w, st(|p| p.stapm_limit), 1000.0);
-        lim("fast", cmd::FAST_LIMIT, t.fast_w, prev.fast_w, st(|p| p.fast_limit), 1000.0);
-        lim("slow", cmd::SLOW_LIMIT, t.slow_w, prev.slow_w, st(|p| p.slow_limit), 1000.0);
-        lim("tctl", cmd::TCTL_TEMP, t.tctl_c, prev.tctl_c, st(|p| p.tctl_limit), 1.0);
-        lim("tdc", cmd::VRM_CURRENT, t.tdc_a, prev.tdc_a, st(|p| p.tdc_limit), 1000.0);
-        lim("soc_tdc", cmd::VRMSOC_CURRENT, t.soc_tdc_a, prev.soc_tdc_a, st(|p| p.soc_tdc_limit), 1000.0);
-        lim("edc", cmd::VRMMAX_CURRENT, t.edc_a, prev.edc_a, st(|p| p.edc_limit), 1000.0);
-        lim("soc_edc", cmd::VRMSOCMAX_CURRENT, t.soc_edc_a, prev.soc_edc_a, st(|p| p.soc_edc_limit), 1000.0);
-
-        // Curve Optimizer: all-core first, then per-core overrides. Any core
-        // that had a per-core value and no longer does falls back to co_all.
-        let co_changed = t.co_all != prev.co_all || t.co_cores != prev.co_cores;
-        if co_changed {
-            let all = t.co_all.unwrap_or(0);
-            match self.mp1(cmd::CO_ALL, co_arg(all)) {
-                Ok(()) => sent.push(format!("co_all={all}")),
-                Err(e) => errs.push(format!("co_all: {e}")),
-            }
-            let mut cores: Vec<u32> = t.co_cores.keys().chain(prev.co_cores.keys()).copied().collect();
-            cores.sort();
-            cores.dedup();
-            for core in cores {
-                let v = t.co_cores.get(&core).copied().unwrap_or(all);
-                match self.mp1(cmd::CO_PER_CORE, co_core_arg(core, v)) {
-                    Ok(()) => sent.push(format!("co[{core}]={v}")),
-                    Err(e) => errs.push(format!("co[{core}]: {e}")),
-                }
-            }
-        }
-        (sent, errs, reboot)
     }
 }
 

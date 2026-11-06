@@ -20,7 +20,7 @@ use crate::health::Health;
 use crate::history::{History, SERIES};
 use crate::mem::Mem;
 use crate::platform::Platform;
-use crate::smu::{PmLimits, Smu};
+use crate::smu::{PmLimits, Smu, SmuIo};
 use crate::testrun::TestRun;
 use crate::tune::{SmuTune, Tune, key_is_risky, value_text};
 use crate::util::{Sys, now, round1, write_atomic};
@@ -87,7 +87,7 @@ pub struct Core {
     pub platform: Platform,
     pub fans: Fans,
     applier: Applier,
-    smu: Option<Smu>,
+    smu: Option<Box<dyn SmuIo>>,
     smu_family: Option<String>,
     smu_error: Option<String>,
     pm: Option<PmLimits>,
@@ -160,7 +160,7 @@ impl Core {
         let (smu, smu_error) = match &smu_family {
             None => (None, Some(format!("no SMU support for {} (family {:#x} model {:#x})", cpu.ident.model, cpu.ident.family, cpu.ident.model_id))),
             Some(f) => match Smu::open(&sys, f) {
-                Ok(s) => (Some(s), None),
+                Ok(s) => (Some(Box::new(s) as Box<dyn SmuIo>), None),
                 Err(e) => (None, Some(e)),
             },
         };
@@ -229,6 +229,14 @@ impl Core {
             core.startup();
         }
         core
+    }
+
+    /// Tests: put in a fake SMU mailbox (and the stock limits it reports).
+    #[doc(hidden)]
+    pub fn set_smu(&mut self, dev: Box<dyn SmuIo>, stock: Option<PmLimits>) {
+        self.smu = Some(dev);
+        self.smu_error = None;
+        self.smu_stock = stock;
     }
 
     fn stock_gpu_w(&self) -> Option<f64> {
@@ -406,16 +414,23 @@ impl Core {
         let mut r = self.applier.execute(&writes);
         match &self.smu {
             Some(smu) => {
-                let (sent, errs, reboot) = smu.apply(&t.smu, &self.smu_applied, self.smu_stock.as_ref());
-                r.changed.extend(sent.into_iter().map(|s| format!("smu {s}")));
-                r.errors.extend(errs);
-                for x in reboot {
+                let rep = crate::smu::apply(smu.as_ref(), &t.smu, &self.smu_applied, self.smu_stock.as_ref());
+                r.changed.extend(rep.sent.into_iter().map(|s| format!("smu {s}")));
+                r.errors.extend(rep.errors);
+                // A field whose command went through no longer waits for a reboot.
+                self.needs_reboot.retain(|n| !rep.done.contains(n));
+                let mut new = Vec::new();
+                for x in rep.needs_reboot {
                     if !self.needs_reboot.contains(&x) {
-                        self.needs_reboot.push(x);
+                        self.needs_reboot.push(x.clone());
+                        new.push(x);
                     }
                 }
-                self.needs_reboot.retain(|n| !smu_field_set(&t.smu, n));
-                self.smu_applied = t.smu.clone();
+                if !new.is_empty() {
+                    self.set_alert(format!("Could not put the SMU back to stock for {}. Reboot to restore it.", new.join(", ")));
+                }
+                // Failed fields stay recorded so a later stop or restore retries them.
+                self.smu_applied = rep.applied;
                 if let Ok(b) = serde_json::to_vec_pretty(&self.smu_applied) {
                     let _ = write_atomic(&self.paths.run("smu-applied.json"), &b, 0o644);
                 }
@@ -461,6 +476,10 @@ impl Core {
         if risky {
             self.set_dirty(name);
         }
+        if origin == Origin::User {
+            // Before the apply, which may raise an alert of its own.
+            self.alert = None;
+        }
         let r = self.apply_tune(&t);
         self.active = name.to_string();
         self.health_base = self.health.counts();
@@ -470,7 +489,6 @@ impl Core {
             self.cfg.base = name.to_string();
             self.auto_profile = None;
             self.auto_blocked = None;
-            self.alert = None;
         }
         self.set_pending(if risky && !confirmed && origin == Origin::User {
             Some(Pending { profile: name.to_string(), previous, deadline: now() + self.cfg.confirm_seconds as f64 })
@@ -1267,20 +1285,6 @@ pub fn fans_proxy(fans: &Fans, req: &Value) -> Result<Value, String> {
     fans.call(&inner)
 }
 
-fn smu_field_set(t: &SmuTune, name: &str) -> bool {
-    match name {
-        "stapm" => t.stapm_w.is_some(),
-        "fast" => t.fast_w.is_some(),
-        "slow" => t.slow_w.is_some(),
-        "tctl" => t.tctl_c.is_some(),
-        "tdc" => t.tdc_a.is_some(),
-        "edc" => t.edc_a.is_some(),
-        "soc_tdc" => t.soc_tdc_a.is_some(),
-        "soc_edc" => t.soc_edc_a.is_some(),
-        _ => false,
-    }
-}
-
 pub struct Proc {
     pub comm: String,
     pub argv0: String,
@@ -1337,22 +1341,37 @@ pub fn restore(sys: Sys, paths: Paths) -> Vec<String> {
     out.extend(r.errors.iter().map(|e| format!("error: {e}")));
     let applied: SmuTune = read_json(&paths.run("smu-applied.json")).unwrap_or_default();
     if !applied.is_empty() {
-        let stock: Option<PmLimits> = read_json(&paths.run("smu-stock.json"));
         let cpu = Cpu::detect(&sys);
         if let Some(f) = crate::smu::supported(&cpu.ident.vendor, cpu.ident.family, cpu.ident.model_id) {
             match Smu::open(&sys, f) {
-                Ok(s) => {
-                    let (sent, errs, reboot) = s.apply(&SmuTune::default(), &applied, stock.as_ref());
-                    out.extend(sent.into_iter().map(|x| format!("smu {x}")));
-                    out.extend(errs.into_iter().map(|e| format!("error: {e}")));
-                    if !reboot.is_empty() {
-                        out.push(format!("reboot to restore: {}", reboot.join(", ")));
-                    }
-                    let _ = std::fs::remove_file(paths.run("smu-applied.json"));
-                }
+                Ok(s) => out.extend(restore_smu(&s, &paths)),
                 Err(e) => out.push(format!("error: SMU: {e}")),
             }
         }
+    }
+    out
+}
+
+/// Put the SMU limits in run/smu-applied.json back to stock. The record
+/// goes only when every field was restored; otherwise it keeps the ones
+/// still set, for the next start or restore to retry.
+pub fn restore_smu(dev: &dyn SmuIo, paths: &Paths) -> Vec<String> {
+    let mut out = Vec::new();
+    let applied: SmuTune = read_json(&paths.run("smu-applied.json")).unwrap_or_default();
+    if applied.is_empty() {
+        return out;
+    }
+    let stock: Option<PmLimits> = read_json(&paths.run("smu-stock.json"));
+    let rep = crate::smu::apply(dev, &SmuTune::default(), &applied, stock.as_ref());
+    out.extend(rep.sent.into_iter().map(|x| format!("smu {x}")));
+    out.extend(rep.errors.into_iter().map(|e| format!("error: {e}")));
+    if !rep.needs_reboot.is_empty() {
+        out.push(format!("reboot to restore: {}", rep.needs_reboot.join(", ")));
+    }
+    if rep.applied.is_empty() {
+        let _ = std::fs::remove_file(paths.run("smu-applied.json"));
+    } else if let Ok(b) = serde_json::to_vec_pretty(&rep.applied) {
+        let _ = write_atomic(&paths.run("smu-applied.json"), &b, 0o644);
     }
     out
 }

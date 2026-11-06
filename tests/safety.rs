@@ -403,3 +403,95 @@ fn watchdog_falls_back_to_stock_when_fallback_became_risky() {
     assert_eq!(r(&f.root, GPU_PL), "150000000");
     assert!(c.status(1)["alert"].as_str().unwrap_or("").contains("\"stock\""));
 }
+
+// ---- SMU restores that fail are not forgotten (I1) ----------------------------
+
+use common::{FakeSmu, stock_limits};
+use omarchy_oc::smu::{self, cmd};
+use omarchy_oc::tune::SmuTune;
+
+#[test]
+fn smu_busy_is_retried_once() {
+    let fake = FakeSmu::default();
+    fake.state().script.insert(cmd::FAST_LIMIT, [0xFC].into());
+    let t = SmuTune { fast_w: Some(90), ..Default::default() };
+    let rep = smu::apply(&fake, &t, &SmuTune::default(), Some(&stock_limits()));
+    assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+    assert_eq!(fake.count(cmd::FAST_LIMIT), 2, "busy once, then accepted");
+    // Busy twice: an error, and only one retry.
+    let fake = FakeSmu::default();
+    fake.state().script.insert(cmd::FAST_LIMIT, [0xFC, 0xFC, 0xFC].into());
+    let rep = smu::apply(&fake, &t, &SmuTune::default(), Some(&stock_limits()));
+    assert_eq!(rep.errors.len(), 1, "{:?}", rep.errors);
+    assert_eq!(fake.count(cmd::FAST_LIMIT), 2);
+    assert_eq!(rep.applied.fast_w, Some(90), "maybe set: a restore must still try it");
+    // Other failures are not retried.
+    let fake = FakeSmu::default();
+    fake.state().script.insert(cmd::FAST_LIMIT, [0xFF].into());
+    smu::apply(&fake, &t, &SmuTune::default(), Some(&stock_limits()));
+    assert_eq!(fake.count(cmd::FAST_LIMIT), 1);
+}
+
+#[test]
+fn smu_failed_restore_stays_applied_and_needs_reboot() {
+    let fake = FakeSmu::default();
+    fake.state().always.insert(cmd::STAPM_LIMIT, 0xFF);
+    fake.state().always.insert(cmd::CO_ALL, 0xFF);
+    let prev = SmuTune { stapm_w: Some(50), fast_w: Some(60), co_all: Some(-10), ..Default::default() };
+    let rep = smu::apply(&fake, &SmuTune::default(), &prev, Some(&stock_limits()));
+    assert_eq!(rep.applied.stapm_w, Some(50), "kept for the next restore");
+    assert_eq!(rep.applied.co_all, Some(-10), "kept for the next restore");
+    assert_eq!(rep.applied.fast_w, None, "restored");
+    assert!(rep.needs_reboot.contains(&"stapm".to_string()), "{:?}", rep.needs_reboot);
+    assert!(rep.needs_reboot.contains(&"co_all".to_string()), "{:?}", rep.needs_reboot);
+    assert!(rep.done.contains(&"fast".to_string()), "{:?}", rep.done);
+    // Next time the SMU takes it: nothing left.
+    fake.state().always.clear();
+    let rep = smu::apply(&fake, &SmuTune::default(), &rep.applied, Some(&stock_limits()));
+    assert!(rep.applied.is_empty(), "{:?}", rep.applied);
+    assert!(rep.done.contains(&"stapm".to_string()) && rep.done.contains(&"co_all".to_string()), "{:?}", rep.done);
+}
+
+#[test]
+fn daemon_keeps_failed_smu_restore_and_alerts() {
+    let f = Fake::new("smu-restore-fail");
+    let mut c = f.core();
+    let fake = FakeSmu::with_table(stock_limits());
+    c.set_smu(Box::new(fake.clone()), Some(stock_limits()));
+    call(&mut c, json!({"cmd": "set", "profile": "custom", "key": "smu.stapm_w", "value": "50"})).unwrap();
+    call(&mut c, json!({"cmd": "apply", "profile": "custom"})).unwrap();
+    call(&mut c, json!({"cmd": "confirm"})).unwrap();
+    fake.state().always.insert(cmd::STAPM_LIMIT, 0xFF);
+    call(&mut c, json!({"cmd": "apply", "profile": "stock"})).unwrap();
+    let st = c.status(1);
+    assert_eq!(st["smu"]["applied"]["stapm_w"], json!(50), "{}", st["smu"]);
+    assert_eq!(st["smu"]["needs_reboot"], json!(["stapm"]), "{}", st["smu"]);
+    assert!(st["alert"].as_str().unwrap_or("").contains("stapm"), "{}", st["alert"]);
+    let saved: Value = serde_json::from_slice(&std::fs::read(f.dir.join("run/smu-applied.json")).unwrap()).unwrap();
+    assert_eq!(saved["stapm_w"], json!(50), "restore can retry it: {saved}");
+    // The SMU recovers: the daemon's stop puts it back and forgets it.
+    fake.state().always.clear();
+    c.shutdown();
+    let saved: Value = serde_json::from_slice(&std::fs::read(f.dir.join("run/smu-applied.json")).unwrap()).unwrap();
+    assert_eq!(saved["stapm_w"], Value::Null, "{saved}");
+    assert_eq!(fake.state().sent.last(), Some(&(cmd::STAPM_LIMIT, 65000)));
+}
+
+#[test]
+fn restore_smu_deletes_record_only_when_all_restored() {
+    let f = Fake::new("smu-restore-file");
+    let p = f.paths();
+    std::fs::create_dir_all(&p.run_dir).unwrap();
+    let applied = SmuTune { stapm_w: Some(50), fast_w: Some(60), ..Default::default() };
+    std::fs::write(p.run("smu-applied.json"), serde_json::to_vec(&applied).unwrap()).unwrap();
+    std::fs::write(p.run("smu-stock.json"), serde_json::to_vec(&stock_limits()).unwrap()).unwrap();
+    let fake = FakeSmu::default();
+    fake.state().always.insert(cmd::STAPM_LIMIT, 0xFF);
+    let out = omarchy_oc::daemon::restore_smu(&fake, &p);
+    let left: SmuTune = serde_json::from_slice(&std::fs::read(p.run("smu-applied.json")).expect("kept")).unwrap();
+    assert_eq!(left, SmuTune { stapm_w: Some(50), ..Default::default() }, "{out:?}");
+    assert!(out.iter().any(|l| l.contains("stapm")), "{out:?}");
+    fake.state().always.clear();
+    let out = omarchy_oc::daemon::restore_smu(&fake, &p);
+    assert!(!p.run("smu-applied.json").exists(), "{out:?}");
+}

@@ -2,9 +2,12 @@
 #![allow(dead_code)]
 
 use omarchy_oc::daemon::{Core, Paths};
+use omarchy_oc::smu::{PmLimits, SmuIo};
 use omarchy_oc::util::Sys;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub fn w(root: &Path, rel: &str, v: &str) {
     let p = root.join(rel.trim_start_matches('/'));
@@ -103,6 +106,66 @@ impl Fake {
     pub fn reboot(&self) {
         w(&self.root, "/proc/sys/kernel/random/boot_id", "boot-2");
         let _ = fs::remove_dir_all(self.dir.join("run"));
+    }
+}
+
+/// A scripted SMU mailbox: every MP1 command answers OK (0x1) unless a
+/// response is queued for its id (`script`, used once each) or set for good
+/// (`always`). `sent` logs (id, arg) of every command.
+#[derive(Default)]
+pub struct FakeSmuState {
+    pub sent: Vec<(u32, u32)>,
+    pub script: BTreeMap<u32, VecDeque<u32>>,
+    pub always: BTreeMap<u32, u32>,
+    pub table: PmLimits,
+}
+
+#[derive(Clone, Default)]
+pub struct FakeSmu(pub Arc<Mutex<FakeSmuState>>);
+
+impl FakeSmu {
+    pub fn with_table(table: PmLimits) -> FakeSmu {
+        let f = FakeSmu::default();
+        f.0.lock().unwrap().table = table;
+        f
+    }
+    pub fn state(&self) -> std::sync::MutexGuard<'_, FakeSmuState> {
+        self.0.lock().unwrap()
+    }
+    /// How many times command `id` was sent.
+    pub fn count(&self, id: u32) -> usize {
+        self.state().sent.iter().filter(|(i, _)| *i == id).count()
+    }
+}
+
+impl SmuIo for FakeSmu {
+    fn mp1_raw(&self, id: u32, arg0: u32) -> u32 {
+        let mut s = self.state();
+        s.sent.push((id, arg0));
+        if let Some(r) = s.script.get_mut(&id).and_then(VecDeque::pop_front) {
+            return r;
+        }
+        s.always.get(&id).copied().unwrap_or(1)
+    }
+
+    fn read_table(&self, _sys: &Sys) -> Result<PmLimits, String> {
+        Ok(self.state().table.clone())
+    }
+}
+
+/// The 8500G's stock limits, as the PM table reports them.
+pub fn stock_limits() -> PmLimits {
+    PmLimits {
+        table_version: 0x4C0006,
+        stapm_limit: Some(65.0),
+        fast_limit: Some(88.0),
+        slow_limit: Some(88.0),
+        tctl_limit: Some(95.0),
+        tdc_limit: Some(75.0),
+        edc_limit: Some(110.0),
+        soc_tdc_limit: Some(15.0),
+        soc_edc_limit: Some(20.0),
+        ..Default::default()
     }
 }
 
