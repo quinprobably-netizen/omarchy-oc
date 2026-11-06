@@ -509,3 +509,13 @@ test("staged changes survive a live fork and apply to the new active profile (R2
   assert.equal(M.stagedCount(M.retarget(null, "custom")), 0)
 })
 
+test("default favourites leave out the overclock profile (R23)", () => {
+  const fs = require("node:fs")
+  const path = require("node:path")
+  const man = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"))
+  assert.equal(man.barWidget.defaults.favourites, "eco,balanced,performance")
+  const field = man.barWidget.schema.find(f => f.key === "favourites")
+  assert.equal(field.defaultValue, "eco,balanced,performance")
+  const panel = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
+  assert.match(panel, /setting\("favourites", "eco,balanced,performance"\)/)
+})

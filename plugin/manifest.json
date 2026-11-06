@@ -21,12 +21,12 @@
     "defaults": {
       "barMode": "Temps",
       "socketPath": "/run/omarchy-oc/control.sock",
-      "favourites": "eco,balanced,max"
+      "favourites": "eco,balanced,performance"
     },
     "schema": [
       { "key": "barMode", "type": "enum", "label": "Bar display", "options": ["Temps", "Clocks", "Icon"], "defaultValue": "Temps" },
       { "key": "socketPath", "type": "string", "label": "Daemon socket", "defaultValue": "/run/omarchy-oc/control.sock", "description": "Control socket of omarchy-ocd." },
-      { "key": "favourites", "type": "string", "label": "Favourite profiles", "defaultValue": "eco,balanced,max", "description": "Comma-separated profiles a right click on the bar widget cycles through." }
+      { "key": "favourites", "type": "string", "label": "Favourite profiles", "defaultValue": "eco,balanced,performance", "description": "Comma-separated profiles a right click on the bar widget cycles through." }
     ]
   }
 }

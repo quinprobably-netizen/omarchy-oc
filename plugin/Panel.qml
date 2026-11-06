@@ -24,7 +24,7 @@ Panel {
 
   readonly property string socketPath: String(setting("socketPath", "/run/omarchy-oc/control.sock"))
   readonly property string barMode: String(setting("barMode", "Temps"))
-  readonly property string favourites: String(setting("favourites", "eco,balanced,max"))
+  readonly property string favourites: String(setting("favourites", "eco,balanced,performance"))
 
   Commons.Translations { id: catalog; directory: Qt.resolvedUrl("i18n") }
   readonly property var strings: catalog
