@@ -513,9 +513,19 @@ impl Core {
         r
     }
 
+    /// Where the watchdog goes: the configured fallback while it exists and
+    /// is safe, else stock (a fallback edited into an overclock later is
+    /// no refuge).
+    fn fallback_profile(&self) -> String {
+        let fb = &self.cfg.watchdog.fallback;
+        match self.cfg.profile(fb) {
+            Some(t) if !self.risky(&t) => fb.clone(),
+            _ => "stock".into(),
+        }
+    }
+
     fn fallback(&mut self, reason: String) {
-        let fb = self.cfg.watchdog.fallback.clone();
-        let fb = if self.cfg.profile_exists(&fb) { fb } else { "stock".into() };
+        let fb = self.fallback_profile();
         self.set_pending(None);
         if let Some(a) = self.auto_profile.clone() {
             self.auto_blocked = Some(a);
@@ -631,7 +641,7 @@ impl Core {
 
     fn watchdog(&mut self) {
         let wd = self.cfg.watchdog.clone();
-        if !wd.enabled || self.active == wd.fallback || self.active == "stock" {
+        if !wd.enabled || self.active == self.fallback_profile() || self.active == "stock" {
             self.hot_secs = 0;
             return;
         }
@@ -1125,6 +1135,13 @@ impl Core {
                 Ok(Value::Array(names.into_iter().map(|n| json!({"name": n})).collect()))
             }
             "watchdog" => {
+                // Checked first: a refused request changes nothing.
+                if let Some(v) = s("fallback") {
+                    let t = self.cfg.profile(v).ok_or_else(|| format!("no profile named \"{v}\""))?;
+                    if self.risky(&t) {
+                        return Err(format!("\"{v}\" has overclock settings; the watchdog fallback must be a safe profile"));
+                    }
+                }
                 let w = &mut self.cfg.watchdog;
                 if let Some(v) = b("enabled") {
                     w.enabled = v;
@@ -1142,9 +1159,6 @@ impl Core {
                     w.seconds = (v as u32).clamp(1, 120);
                 }
                 if let Some(v) = s("fallback") {
-                    if !self.cfg.profile_exists(v) {
-                        return Err(format!("no profile named \"{v}\""));
-                    }
                     self.cfg.watchdog.fallback = v.to_string();
                 }
                 self.save_cfg();

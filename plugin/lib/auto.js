@@ -154,12 +154,21 @@ function profileOptions(st, label) {
   return out
 }
 
+// The watchdog's fallback picker: only profiles without overclock settings
+// (the daemon refuses a risky fallback and would use stock instead).
+function fallbackOptions(st, label) {
+  if (!st || !st.profiles || st.profiles.length === undefined) return []
+  var safe = {}
+  for (var i = 0; i < st.profiles.length; i++) if (st.profiles[i].risky !== true) safe[String(st.profiles[i].name || "")] = true
+  return profileOptions(st, label).filter(function(o) { return safe[o.value] === true })
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     NAME_MAX: NAME_MAX, CONFIRM_OPTIONS: CONFIRM_OPTIONS, WATCHDOG_BOUNDS: WATCHDOG_BOUNDS, BUILTIN_MATCHERS: BUILTIN_MATCHERS,
     ruleLabel: ruleLabel, ruleRows: ruleRows, matcherOptions: matcherOptions, listChanged: listChanged,
     confirmValue: confirmValue, confirmSeconds: confirmSeconds,
     watchdogLine: watchdogLine, watchdogClamp: watchdogClamp, watchdogShown: watchdogShown, watchdogSettled: watchdogSettled,
-    profileOptions: profileOptions
+    profileOptions: profileOptions, fallbackOptions: fallbackOptions
   }
 }

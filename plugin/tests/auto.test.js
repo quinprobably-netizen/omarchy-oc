@@ -121,3 +121,12 @@ test("listChanged: a Repeater model is replaced only when its content differs", 
 test("the Auto page is wired into the rail", () => {
   assert.equal(M.pageSource("auto"), "pages/Auto.qml")
 })
+
+test("fallbackOptions offers only profiles without overclock settings", () => {
+  const st = { profiles: [
+    { name: "stock", risky: false }, { name: "eco", risky: false }, { name: "max", risky: true },
+    { name: "custom", risky: true }, { name: "quiet", risky: false },
+  ] }
+  assert.deepEqual(A.fallbackOptions(st, M.profileLabel).map(o => o.value), ["stock", "eco", "quiet"])
+  assert.deepEqual(A.fallbackOptions(null, M.profileLabel), [])
+})

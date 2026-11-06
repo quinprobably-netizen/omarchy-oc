@@ -34,6 +34,8 @@ Column {
   // the Repeaters would rebuild their delegates every second.
   property var rules: []
   property var profiles: []
+  // The fallback picker leaves out profiles with overclock settings.
+  property var fallbackProfiles: []
   property var matchers: []
   // The rule whose profile picker is open (−1: none). Page state, not
   // delegate state, so it survives a rebuilt delegate.
@@ -64,6 +66,8 @@ Column {
     }
     var nextProfiles = Auto.profileOptions(st, Model.profileLabel)
     if (Auto.listChanged(profiles, nextProfiles)) profiles = nextProfiles
+    var nextFallbacks = Auto.fallbackOptions(st, Model.profileLabel)
+    if (Auto.listChanged(fallbackProfiles, nextFallbacks)) fallbackProfiles = nextFallbacks
     refreshMatchers()
   }
   Component.onCompleted: stChanged()
@@ -500,7 +504,7 @@ Column {
     RowLabel { text: page.strings.t("auto.watchdog.fallback") }
     Segmented {
       anchors.verticalCenter: parent.verticalCenter
-      options: page.profiles
+      options: page.fallbackProfiles
       value: page.wd ? String(page.wd.fallback || "") : ""
       enabled: page.wdOn
       foreground: page.fg; accent: page.accent; fontFamily: page.fontFamily

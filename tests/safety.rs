@@ -369,3 +369,37 @@ fn restore_drops_resume_marker_when_dirty() {
     assert!(!f.dir.join("run/active").exists(), "{out:?}");
     assert_eq!(r(&f.root, GPU_PL), "150000000");
 }
+
+// ---- watchdog fallback is never an overclock (C2) ------------------------------
+
+#[test]
+fn watchdog_rejects_risky_fallback() {
+    let f = Fake::new("wd-risky");
+    let mut c = f.core();
+    let err = call(&mut c, json!({"cmd": "watchdog", "fallback": "max"})).unwrap_err();
+    assert!(err.contains("overclock"), "{err}");
+    assert_eq!(c.cfg.watchdog.fallback, "stock", "nothing saved");
+    // Nothing else in a refused request is half-applied either.
+    assert!(call(&mut c, json!({"cmd": "watchdog", "fallback": "max", "seconds": 9})).is_err());
+    assert_eq!(c.cfg.watchdog.seconds, 5);
+    let res = call(&mut c, json!({"cmd": "watchdog", "fallback": "eco"})).unwrap();
+    assert_eq!(res["fallback"], json!("eco"));
+}
+
+#[test]
+fn watchdog_falls_back_to_stock_when_fallback_became_risky() {
+    let f = Fake::new("wd-became-risky");
+    let mut c = f.core();
+    // A safe fallback when chosen...
+    call(&mut c, json!({"cmd": "watchdog", "fallback": "custom", "gpu_max_c": 60, "seconds": 1})).unwrap();
+    // ...that later gained an overclock and is now the running profile.
+    call(&mut c, json!({"cmd": "set", "profile": "custom", "key": "gpu.power_w", "value": "180"})).unwrap();
+    call(&mut c, json!({"cmd": "apply", "profile": "custom"})).unwrap();
+    call(&mut c, json!({"cmd": "confirm"})).unwrap();
+    assert_eq!(r(&f.root, GPU_PL), "180000000");
+    w(&f.root, "/sys/devices/pci0000:00/0000:00:01.1/0000:03:00.0/hwmon/hwmon2/temp2_input", "70000");
+    c.tick();
+    assert_eq!(c.active, "stock", "the watchdog never falls back to an overclock");
+    assert_eq!(r(&f.root, GPU_PL), "150000000");
+    assert!(c.status(1)["alert"].as_str().unwrap_or("").contains("\"stock\""));
+}
