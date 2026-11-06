@@ -1002,7 +1002,9 @@ impl Core {
                 // The panel's live edit: a batch of dotted keys. Safe changes
                 // apply at once when the profile is active; risky ones need
                 // "apply": true and open the Keep/Revert window. Editing a
-                // built-in forks it into "custom", which then becomes active.
+                // built-in forks it into "custom" (or the first free
+                // "custom-N" when "custom" holds edits), which then becomes
+                // active; the reply's "profile" names it.
                 let p = name_arg("profile")?;
                 let changes = req.get("changes").and_then(Value::as_object).ok_or("missing \"changes\"")?;
                 let apply = b("apply").unwrap_or(false);
@@ -1016,7 +1018,7 @@ impl Core {
                     return Err(format!("risky changes need Apply: {}", risky.join(", ")));
                 }
                 let forked = Config::is_builtin(&p);
-                let target = if forked { "custom".to_string() } else { p };
+                let target = if forked { self.fork_name() } else { p };
                 let applies = forked || !risky.is_empty() || self.active == target;
                 if apply || applies {
                     self.no_test_running()?;
@@ -1264,6 +1266,18 @@ impl Core {
             })),
             other => Err(format!("unknown command \"{other}\"")),
         }
+    }
+
+    /// Where an edit of a built-in goes: "custom" while it is missing or
+    /// still the empty default, else the first free "custom-N" (N = 2..),
+    /// so a fork never overwrites a profile the user made.
+    fn fork_name(&self) -> String {
+        match self.cfg.profiles.get("custom") {
+            None => return "custom".into(),
+            Some(t) if *t == Tune::default() => return "custom".into(),
+            Some(_) => {}
+        }
+        (2..).map(|n| format!("custom-{n}")).find(|n| !self.cfg.profile_exists(n)).expect("a free name")
     }
 
     fn reapply_if_active(&mut self, p: &str) -> Result<Value, String> {

@@ -525,3 +525,31 @@ fn passive_without_config_space_reports_smu_unavailable() {
     let e = st["caps"]["smu_error"].as_str().unwrap_or("");
     assert!(!e.contains("host bridge"), "the config space was not even opened: {e}");
 }
+
+// ---- forking a built-in never overwrites a user profile (I3, R21) -------------
+
+#[test]
+fn fork_never_overwrites_an_edited_custom() {
+    let f = Fake::new("fork-free-name");
+    let mut c = f.core();
+    // "custom" exists but is still the empty default: the fork takes it.
+    call(&mut c, json!({"cmd": "apply", "profile": "balanced"})).unwrap();
+    let res = call(&mut c, json!({"cmd": "edit", "profile": "balanced", "changes": {"cpu.epp": "power"}})).unwrap();
+    assert_eq!(res["profile"], json!("custom"), "{res}");
+    // Now "custom" holds the user's edits: the next fork goes elsewhere.
+    call(&mut c, json!({"cmd": "apply", "profile": "eco"})).unwrap();
+    let res = call(&mut c, json!({"cmd": "edit", "profile": "eco", "changes": {"cpu.epp": "performance"}})).unwrap();
+    assert_eq!(res["profile"], json!("custom-2"), "{res}");
+    assert_eq!(c.active, "custom-2");
+    assert_eq!(c.cfg.profiles["custom"].cpu.epp.as_deref(), Some("power"), "untouched");
+    assert_eq!(c.cfg.profiles["custom-2"].cpu.epp.as_deref(), Some("performance"));
+    // And the next free number after that.
+    call(&mut c, json!({"cmd": "apply", "profile": "stock"})).unwrap();
+    let res = call(&mut c, json!({"cmd": "edit", "profile": "stock", "changes": {"gpu.max_mhz": 2000}})).unwrap();
+    assert_eq!(res["profile"], json!("custom-3"), "{res}");
+    // A deleted "custom" is free again.
+    call(&mut c, json!({"cmd": "delete", "profile": "custom"})).unwrap();
+    call(&mut c, json!({"cmd": "apply", "profile": "eco"})).unwrap();
+    let res = call(&mut c, json!({"cmd": "edit", "profile": "eco", "changes": {"cpu.epp": "power"}})).unwrap();
+    assert_eq!(res["profile"], json!("custom"), "{res}");
+}
