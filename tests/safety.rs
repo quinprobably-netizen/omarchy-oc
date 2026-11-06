@@ -283,3 +283,89 @@ fn rule_set_changes_profile_in_place() {
     let st = c.status(1);
     assert_eq!(st["rules"][0]["profile"], json!("performance"));
 }
+
+// ---- same-boot daemon crash (C1) ---------------------------------------------
+
+const GPU_PL: &str = "/sys/devices/pci0000:00/0000:00:01.1/0000:03:00.0/hwmon/hwmon2/power2_max";
+
+#[test]
+fn same_boot_crash_while_unconfirmed_starts_at_stock() {
+    let f = Fake::new("sameboot-crash");
+    {
+        let mut c = f.core();
+        let res = call(&mut c, json!({"cmd": "apply", "profile": "max"})).unwrap();
+        assert_eq!(res["pending"], json!(true));
+        // The daemon dies here (panic, SIGKILL): no shutdown(); systemd
+        // restarts it on the same boot.
+    }
+    assert_eq!(r(&f.root, GPU_PL), "190000000");
+    let c = f.core();
+    assert_eq!(c.active, "stock", "an unconfirmed overclock is never resumed");
+    assert_eq!(r(&f.root, GPU_PL), "150000000", "startup puts stock back itself");
+    let st = c.status(1);
+    let alert = st["alert"].as_str().unwrap_or("");
+    assert!(alert.contains("\"max\""), "alert names the profile: {alert}");
+    assert!(!f.dir.join("state/dirty").exists());
+    assert_eq!(st["pending"], Value::Null);
+}
+
+#[test]
+fn same_boot_crash_under_test_starts_at_stock() {
+    let f = Fake::new("sameboot-test");
+    {
+        let mut c = f.core();
+        call(&mut c, json!({"cmd": "apply", "profile": "max"})).unwrap();
+        call(&mut c, json!({"cmd": "confirm"})).unwrap();
+        call(&mut c, json!({"cmd": "stress-begin", "kind": "cpu"})).unwrap();
+    }
+    let c = f.core();
+    assert_eq!(c.active, "stock", "a crash under test starts at stock");
+    assert!(c.status(1)["alert"].as_str().unwrap_or("").contains("\"max\""));
+}
+
+#[test]
+fn resume_refuses_unconfirmed_risky_profile() {
+    let f = Fake::new("resume-refuse");
+    {
+        let mut c = f.core();
+        call(&mut c, json!({"cmd": "apply", "profile": "max"})).unwrap();
+    }
+    // Even without the dirty marker, run/active alone must not bring back
+    // an overclock that was never kept.
+    std::fs::remove_file(f.dir.join("state/dirty")).unwrap();
+    let c = f.core();
+    assert_eq!(c.active, "stock");
+    assert_eq!(r(&f.root, GPU_PL), "150000000");
+    let st = c.status(1);
+    assert!(st["alert"].as_str().unwrap_or("").contains("\"max\""), "{}", st["alert"]);
+}
+
+#[test]
+fn resume_reapplies_kept_risky_profile() {
+    let f = Fake::new("resume-kept");
+    {
+        let mut c = f.core();
+        call(&mut c, json!({"cmd": "apply", "profile": "max"})).unwrap();
+        call(&mut c, json!({"cmd": "confirm"})).unwrap();
+    }
+    // restore (ExecStopPost) keeps the resume marker: nothing was dirty.
+    omarchy_oc::daemon::restore(omarchy_oc::util::Sys::new(&f.root), f.paths());
+    assert!(f.dir.join("run/active").exists());
+    let c = f.core();
+    assert_eq!(c.active, "max", "a kept profile carries on after a restart");
+    assert_eq!(r(&f.root, GPU_PL), "190000000");
+    assert_eq!(c.status(1)["alert"], Value::Null);
+}
+
+#[test]
+fn restore_drops_resume_marker_when_dirty() {
+    let f = Fake::new("restore-dirty");
+    {
+        let mut c = f.core();
+        call(&mut c, json!({"cmd": "apply", "profile": "max"})).unwrap();
+    }
+    assert!(f.dir.join("run/active").exists());
+    let out = omarchy_oc::daemon::restore(omarchy_oc::util::Sys::new(&f.root), f.paths());
+    assert!(!f.dir.join("run/active").exists(), "{out:?}");
+    assert_eq!(r(&f.root, GPU_PL), "150000000");
+}

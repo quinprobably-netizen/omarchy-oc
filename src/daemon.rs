@@ -4,7 +4,8 @@
 //! * risky settings (SMU limits, Curve Optimizer, raised GPU power) revert
 //!   by themselves unless confirmed within `confirm_seconds`;
 //! * a crash while risky settings were unconfirmed or under test means the
-//!   next boot starts at stock; two crashes with a profile stop it from
+//!   next boot (or the daemon's restart on the same boot) starts at stock;
+//!   an unconfirmed overclock is never resumed; two crashes with a profile stop it from
 //!   applying at boot;
 //! * the watchdog falls back to a safe profile on overheating, machine
 //!   check errors or GPU hangs;
@@ -307,7 +308,16 @@ impl Core {
         // Same boot: the daemon itself restarted; carry on where it was.
         let same_boot_active = marker(self.paths.run("active")).map(|(p, _)| p);
         if let Some((profile, boot)) = marker(self.paths.state("dirty")) {
-            if boot != self.boot_id {
+            if boot == self.boot_id {
+                // The daemon died (panic, SIGKILL) during a Keep/Revert
+                // window or a test: nobody kept those settings, so start
+                // at stock (`restore` should have done it; make sure).
+                crashed = true;
+                let _ = self.apply_tune(&Tune::default());
+                self.set_alert(format!(
+                    "omarchy-ocd stopped unexpectedly while \"{profile}\" was unconfirmed or under test. Started at stock settings."
+                ));
+            } else {
                 crashed = true;
                 if let Some(t) = self.cfg.profile(&profile) {
                     let s = self.cfg.stability_mut(&profile, &t);
@@ -337,7 +347,7 @@ impl Core {
             }
         }
         self.save_cfg();
-        let target = if let Some(p) = same_boot_active.filter(|p| self.cfg.profile_exists(p)) {
+        let target = if let Some(p) = same_boot_active.filter(|p| !crashed && self.cfg.profile_exists(p)) {
             Some((p, Origin::Resume))
         } else if self.cfg.boot_apply && !crashed && self.cfg.base != "stock" {
             Some((self.cfg.base.clone(), Origin::Boot))
@@ -347,6 +357,14 @@ impl Core {
         if let Some((p, origin)) = target {
             match self.apply_profile(&p, origin) {
                 Ok(_) => self.message = format!("Applied \"{p}\" at start"),
+                Err(e) if origin == Origin::Resume => {
+                    // Still on the hardware if `restore` did not run.
+                    let _ = self.apply_tune(&Tune::default());
+                    self.message = e;
+                    self.set_alert(format!(
+                        "omarchy-ocd restarted while \"{p}\" was active but never kept. Started at stock settings."
+                    ));
+                }
                 Err(e) => self.message = e,
             }
         }
@@ -425,10 +443,14 @@ impl Core {
         let t = self.cfg.profile(name).ok_or_else(|| format!("no profile named \"{name}\""))?;
         let risky = self.risky(&t);
         let confirmed = self.cfg.stable(name, &t).is_some_and(|s| s.confirmed);
-        if risky && !confirmed && matches!(origin, Origin::Boot | Origin::Rule) {
+        if risky && !confirmed && matches!(origin, Origin::Boot | Origin::Rule | Origin::Resume) {
             return Err(format!(
                 "\"{name}\" has unconfirmed overclock settings; apply it by hand and keep it once before it can apply {}",
-                if origin == Origin::Boot { "at boot" } else { "automatically" }
+                match origin {
+                    Origin::Boot => "at boot",
+                    Origin::Resume => "after a daemon restart",
+                    _ => "automatically",
+                }
             ));
         }
         // The safe profile to go back to is the last one that was not pending.
@@ -1290,6 +1312,11 @@ pub fn rule_matches(r: &Rule, procs: &[Proc]) -> bool {
 /// limits, without a running daemon (systemd ExecStopPost).
 pub fn restore(sys: Sys, paths: Paths) -> Vec<String> {
     let mut out = Vec::new();
+    // Settings that were unconfirmed or under test must not come back when
+    // systemd restarts the daemon: drop its resume marker.
+    if paths.state("dirty").exists() && std::fs::remove_file(paths.run("active")).is_ok() {
+        out.push("dropped the resume marker (settings were unconfirmed or under test)".into());
+    }
     let mut a = Applier::load(&sys, paths.run("original.json"));
     let r = a.restore_all();
     out.extend(r.changed.iter().map(|c| format!("restored {c}")));
