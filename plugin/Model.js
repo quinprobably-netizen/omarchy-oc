@@ -28,7 +28,7 @@ var PAGES = [
   { key: "memory",   icon: "󰘚", label: "Memory", file: "Memory.qml" },      // 󰘚
   { key: "fans",     icon: "󰈐", label: "Fans", file: "Fans.qml" },          // 󰈐
   { key: "auto",     icon: "󰁪", label: "Auto", file: "Auto.qml" },          // 󰁪
-  { key: "test",     icon: "󰙨", label: "Test" }                             // 󰙨
+  { key: "test",     icon: "󰙨", label: "Test", file: "Test.qml" }          // 󰙨
 ]
 
 function pageIndex(key) {

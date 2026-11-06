@@ -418,7 +418,7 @@ test("pages", () => {
   assert.equal(M.pageIndex("gpu"), 2)
   assert.equal(M.pageIndex("nope"), 0)
   assert.equal(M.pageSource("overview"), "pages/Overview.qml")
-  assert.equal(M.pageSource("test"), "pages/Placeholder.qml")
+  M.PAGES.forEach(function (p) { assert.ok(p.file, p.key + " has its page") })
 })
 
 test("takeLive holds a live batch until there is a profile to send it to", () => {

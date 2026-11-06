@@ -6,7 +6,9 @@ import "../Model.js" as Model
 // One tile per physical core: "C2 / −20 / 4c ✗". `tiles` is
 // Model.coreTiles() output ({core, tier, co, override, test}); a per-core
 // override draws its value in the accent, the last test verdict is a strip
-// along the bottom (green passed, urgent failed). Tapping a tile emits
+// along the bottom (green passed, urgent failed). A live test (the Test
+// page) sets `test` "run" for a core under load (accent strip, "…") and
+// `errors` for the count on a failed one ("3✗"). Tapping a tile emits
 // `tapped(core)`; `selected` outlines that core.
 Grid {
   id: grid
@@ -41,7 +43,7 @@ Grid {
       id: tile
       required property var modelData
       readonly property bool on: modelData.core === grid.selected
-      readonly property color verdict: modelData.test === "pass" ? grid.okColor : grid.urgent
+      readonly property color verdict: modelData.test === "pass" ? grid.okColor : modelData.test === "run" ? grid.accent : grid.urgent
 
       width: grid.cell
       implicitHeight: col.implicitHeight + Style.space(12)
@@ -89,7 +91,8 @@ Grid {
           textFormat: Text.PlainText
           text: {
             var t = Model.tierLabel(tile.modelData.tier, grid.hasDense)
-            var v = tile.modelData.test === "pass" ? "✓" : tile.modelData.test === "fail" ? "✗" : ""
+            var n = tile.modelData.errors > 0 ? String(tile.modelData.errors) : ""
+            var v = tile.modelData.test === "pass" ? "✓" : tile.modelData.test === "fail" ? n + "✗" : tile.modelData.test === "run" ? "…" : ""
             return [t, v].filter(function(s) { return s !== "" }).join(" ")
           }
           color: tile.modelData.test === "fail" ? grid.urgent : grid.dim

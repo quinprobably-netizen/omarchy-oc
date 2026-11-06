@@ -107,5 +107,40 @@
   "memory.spd": "SPD · EXPO / XMP",
   "memory.spd.slot": "Slot %1",
   "memory.note": "Timings",
-  "memory.loading": "Reading hardware details…"
+  "memory.loading": "Reading hardware details…",
+  "page.test": "Test",
+  "test.title": "Stability test",
+  "test.profile": "profile: %1",
+  "test.kind.cpu": "CPU · all cores",
+  "test.kind.cpu-per-core": "CPU · per core",
+  "test.kind.gpu": "GPU",
+  "test.length": "Length",
+  "test.stop": "Stop",
+  "test.idle": "Runs the error-checking stress test on the active profile. Profile changes wait until it ends.",
+  "test.running": "Running",
+  "test.starting": "starting",
+  "test.cli": "started from the command line",
+  "test.phase.reference": "preparing",
+  "test.phase.all": "all cores",
+  "test.phase.core": "core %1",
+  "test.left": "%1 left",
+  "test.passed": "Passed",
+  "test.failed": "Failed",
+  "test.stopped": "Stopped",
+  "test.unrecorded": "not recorded",
+  "test.errors": {
+    "one": "%1 error",
+    "other": "%1 errors"
+  },
+  "test.iterations": {
+    "one": "%1 iteration",
+    "other": "%1 iterations"
+  },
+  "test.suggest": "C%1 made %2 computation errors at %3 → suggest %4",
+  "test.set": "Set %1",
+  "test.staged": "Staged",
+  "test.history": "History",
+  "test.history.none": "no results yet",
+  "test.result.pass": "passed",
+  "test.result.fail": "failed"
 }
