@@ -199,6 +199,194 @@ test("series pulls a history series as numbers", () => {
   assert.deepEqual(M.series(null, "cpu_mhz"), [])
 })
 
+// ---- CPU page (Task 5) -----------------------------------------------------
+
+// The 6-core status fixture: 2 Zen 4 cores (fast) and 4 Zen 4c (dense).
+const status6 = {
+  ...status,
+  active: "custom",
+  caps: { smu: false, smu_error: "host bridge config space: Permission denied (os error 13)", pm_table: false, pm_error: null },
+  cpu: {
+    model: "AMD Ryzen 5 8500G w/ Radeon 740M Graphics",
+    reading: { mhz_avg: 3506, mhz_max: 5249, temp: 71.125, package_w: 38.2 },
+    knobs: {
+      pstate_mode: "active", pstate_modes: ["active", "passive", "guided"],
+      governor: "performance", governors: ["performance", "powersave"],
+      epp: "performance", epps: ["performance"],
+      boost: true, smt: "on", has_dense: true,
+      idle_states: [{ name: "POLL", disabled: false }, { name: "C1", disabled: false }, { name: "C2", disabled: false }, { name: "C3", disabled: false }],
+    },
+    cores: [
+      { core: 0, tier: "fast", cpu: 0 }, { core: 1, tier: "dense", cpu: 1 }, { core: 2, tier: "dense", cpu: 2 },
+      { core: 3, tier: "dense", cpu: 3 }, { core: 4, tier: "fast", cpu: 4 }, { core: 5, tier: "dense", cpu: 5 },
+    ],
+  },
+  smu: { limits: null, stock: null, applied: {}, needs_reboot: [] },
+}
+
+const smuLive = {
+  limits: { table_version: 1, stapm_limit: 65, stapm_value: 30, fast_limit: 88, fast_value: 38, slow_limit: 75, slow_value: 36, tctl_limit: 95, tctl_value: 71, tdc_limit: 60, tdc_value: 20, edc_limit: 90, edc_value: 25 },
+  stock: { table_version: 1, stapm_limit: 65, fast_limit: 88, slow_limit: 75, tctl_limit: 95, tdc_limit: 60, edc_limit: 90 },
+  applied: {},
+}
+
+test("limitRow maps a PM-table row to value/stock/use with the daemon's bounds", () => {
+  assert.deepEqual(M.limitRow(smuLive, "fast"), { value: 88, stock: 88, use: 38, min: 10, max: 200 })
+  assert.deepEqual(M.limitRow(smuLive, "tctl"), { value: 95, stock: 95, use: 71, min: 60, max: 100 })
+  assert.deepEqual(M.limitRow(smuLive, "tdc"), { value: 60, stock: 60, use: 20, min: 10, max: 250 })
+  assert.deepEqual(M.limitRow(smuLive, "edc"), { value: 90, stock: 90, use: 25, min: 10, max: 250 })
+})
+
+test("limitRow returns nulls when the PM table is unavailable", () => {
+  assert.deepEqual(M.limitRow({ limits: null, stock: null }, "fast"), { value: null, stock: null, use: null, min: 10, max: 200 })
+  assert.deepEqual(M.limitRow(null, "slow"), { value: null, stock: null, use: null, min: 10, max: 200 })
+  // Stock is read even when the live table is gone (lockdown after boot).
+  const r = M.limitRow({ limits: null, stock: smuLive.stock }, "fast")
+  assert.deepEqual(r, { value: null, stock: 88, use: null, min: 10, max: 200 })
+})
+
+test("shownLimit: staged wins, then the profile, then the hardware", () => {
+  assert.equal(M.shownLimit({ "smu.fast_w": 110 }, "smu.fast_w", 100, 88), 110)
+  assert.equal(M.shownLimit({}, "smu.fast_w", 100, 88), 100)
+  assert.equal(M.shownLimit({}, "smu.fast_w", null, 88), 88)
+  assert.equal(M.shownLimit(null, "smu.fast_w", null, null), null)
+  // A staged clear shows the hardware value again, not the profile's.
+  assert.equal(M.shownLimit({ "smu.fast_w": null }, "smu.fast_w", 100, 88), 88)
+})
+
+test("coreTiles: 6 tiles, tiers, CO from co_cores falling back to co_all", () => {
+  const tune = { cpu: {}, smu: { co_all: -10, co_cores: { "2": -20 } } }
+  const tiles = M.coreTiles(status6, tune)
+  assert.equal(tiles.length, 6)
+  assert.deepEqual(tiles.map(t => t.core), [0, 1, 2, 3, 4, 5])
+  assert.deepEqual(tiles.map(t => t.tier), ["fast", "dense", "dense", "dense", "fast", "dense"])
+  assert.deepEqual(tiles.map(t => t.co), [-10, -10, -20, -10, -10, -10])
+  assert.deepEqual(tiles.map(t => t.override), [false, false, true, false, false, false])
+  assert.deepEqual(tiles.map(t => t.test), [null, null, null, null, null, null])
+})
+
+test("coreTiles: no CO at all is 0 (stock); status without cores gives []", () => {
+  const tiles = M.coreTiles(status6, { smu: {} })
+  assert.deepEqual(tiles.map(t => t.co), [0, 0, 0, 0, 0, 0])
+  assert.deepEqual(M.coreTiles(status6, null).map(t => t.co), [0, 0, 0, 0, 0, 0])
+  assert.deepEqual(M.coreTiles(null, null), [])
+  assert.deepEqual(M.coreTiles({ cpu: {} }, null), [])
+})
+
+test("coreTiles: the profile's last CPU test marks every core", () => {
+  const tune = { smu: { co_all: -10 } }
+  const pass = M.coreTiles(status6, tune, { time: 1, seconds: 120, passed: true, errors: 0, detail: "" })
+  assert.deepEqual(pass.map(t => t.test), ["pass", "pass", "pass", "pass", "pass", "pass"])
+  const fail = M.coreTiles(status6, tune, { passed: false, errors: 3 })
+  assert.equal(fail[2].test, "fail")
+})
+
+test("coreTiles: staged changes overlay the profile", () => {
+  const tune = { smu: { co_all: -10, co_cores: { "2": -20 } } }
+  const t1 = M.coreTiles(status6, tune, null, { "smu.co_cores.2": -15, "smu.co_cores.4": -5 })
+  assert.deepEqual(t1.map(t => t.co), [-10, -10, -15, -10, -5, -10])
+  assert.deepEqual(t1.map(t => t.override), [false, false, true, false, true, false])
+  const t2 = M.coreTiles(status6, tune, null, { "smu.co_all": -25 })
+  assert.deepEqual(t2.map(t => t.co), [-25, -25, -20, -25, -25, -25])
+  // A staged clear of the per-core value falls back to co_all.
+  const t3 = M.coreTiles(status6, tune, null, { "smu.co_cores.2": null })
+  assert.equal(t3[2].co, -10)
+  assert.equal(t3[2].override, false)
+})
+
+test("coAll reads the all-core value with staged overlay", () => {
+  const tune = { smu: { co_all: -10 } }
+  assert.equal(M.coAll(tune, null), -10)
+  assert.equal(M.coAll(tune, { "smu.co_all": -25 }), -25)
+  assert.equal(M.coAll(tune, { "smu.co_all": null }), 0)
+  assert.equal(M.coAll(null, null), 0)
+})
+
+test("unstage drops one key and leaves the rest", () => {
+  let s = M.stage(M.emptyStaged(), "custom", "smu.co_all", -10)
+  s = M.stage(s, "custom", "smu.fast_w", 120)
+  const u = M.unstage(s, "smu.co_all")
+  assert.deepEqual(u.changes, { "smu.fast_w": 120 })
+  assert.equal(u.profile, "custom")
+  assert.equal(M.stagedCount(s), 2, "input untouched")
+  assert.deepEqual(M.unstage(null, "x"), M.emptyStaged())
+  assert.deepEqual(M.unstage(u, "nope").changes, { "smu.fast_w": 120 })
+})
+
+test("idleMax: the deepest enabled C-state, null when all are", () => {
+  assert.equal(M.idleMax(status6.cpu.knobs), null)
+  const c2 = { idle_states: [{ name: "POLL" }, { name: "C1" }, { name: "C2" }, { name: "C3", disabled: true }] }
+  assert.equal(M.idleMax(c2), "C2")
+  const c1 = { idle_states: [{ name: "POLL" }, { name: "C1" }, { name: "C2", disabled: true }, { name: "C3", disabled: true }] }
+  assert.equal(M.idleMax(c1), "C1")
+  assert.equal(M.idleMax({}), null)
+  assert.equal(M.idleMax(null), null)
+})
+
+test("cpuHeadline", () => {
+  const h = M.cpuHeadline(status6)
+  assert.equal(h.caption, "Ryzen 5 8500G · 2× Zen 4 + 4× Zen 4c")
+  assert.equal(h.right, "71° · 38 W")
+  const noPower = { ...status6, cpu: { ...status6.cpu, reading: { temp: 40.2, package_w: null } } }
+  assert.equal(M.cpuHeadline(noPower).right, "40°")
+  const plain = { ...status6, cpu: { ...status6.cpu, model: "AMD Ryzen 7 7800X3D 8-Core Processor", knobs: { has_dense: false },
+    cores: [{ core: 0, tier: "fast" }, { core: 1, tier: "fast" }] } }
+  assert.equal(M.cpuHeadline(plain).caption, "Ryzen 7 7800X3D · 2 cores")
+  assert.deepEqual(M.cpuHeadline(null), { caption: "", right: "—" })
+  assert.equal(M.cpuHeadline({ cpu: { model: "<b>x</b>" } }).caption.indexOf("<"), -1, "model is neutralised")
+})
+
+test("tierLabel", () => {
+  assert.equal(M.tierLabel("fast", true), "Zen 4")
+  assert.equal(M.tierLabel("dense", true), "4c")
+  assert.equal(M.tierLabel("fast", false), "")
+  assert.equal(M.tierLabel("weird", true), "weird")
+})
+
+test("smuDisabledReason", () => {
+  assert.equal(M.smuDisabledReason(status6), "host bridge config space: Permission denied (os error 13)")
+  assert.equal(M.smuDisabledReason({ ...status6, caps: { smu: true } }), "")
+  assert.equal(M.smuDisabledReason({ caps: { smu: false, smu_error: null } }), "SMU unavailable")
+  assert.equal(M.smuDisabledReason(null), "SMU unavailable")
+  assert.equal(M.smuDisabledReason({ caps: { smu: false, smu_error: "<img src=x>" } }).indexOf("<"), -1)
+})
+
+test("fmtCo writes a real minus and a plus", () => {
+  assert.equal(M.fmtCo(-15), "−15")
+  assert.equal(M.fmtCo(0), "0")
+  assert.equal(M.fmtCo(5), "+5")
+  assert.equal(M.fmtCo(null), "—")
+})
+
+test("edcFor keeps EDC at the stock ratio to TDC, 1.5 when unknown", () => {
+  assert.equal(M.edcFor(60, 60, 90), 90)
+  assert.equal(M.edcFor(80, 60, 90), 120)
+  assert.equal(M.edcFor(100, null, null), 150)
+  assert.equal(M.edcFor(200, 60, 90), 250, "clamped to the daemon's bound")
+  assert.equal(M.edcFor(5, 60, 90), 10)
+})
+
+test("EPP options are the four the daemon accepts", () => {
+  assert.deepEqual(M.EPP_OPTIONS.map(o => o.value), ["power", "balance_power", "balance_performance", "performance"])
+  assert.deepEqual(M.EPP_OPTIONS.map(o => o.label), ["power", "bal-pwr", "bal-perf", "perf"])
+})
+
+test("ipcValue turns a shell argument into the JSON the daemon expects", () => {
+  assert.equal(M.ipcValue("-5"), -5)
+  assert.equal(M.ipcValue("120"), 120)
+  assert.equal(M.ipcValue("true"), true)
+  assert.equal(M.ipcValue("false"), false)
+  assert.equal(M.ipcValue("null"), null)
+  assert.equal(M.ipcValue(""), null)
+  assert.equal(M.ipcValue("stock"), null)
+  assert.equal(M.ipcValue("balance_power"), "balance_power")
+  assert.equal(M.ipcValue("C2"), "C2")
+})
+
+test("the CPU page is wired into the rail", () => {
+  assert.equal(M.pageSource("cpu"), "pages/Cpu.qml")
+})
+
 test("tile summaries", () => {
   const cpu = M.cpuTile(status)
   assert.equal(cpu.title, "CPU · 2c")
@@ -230,7 +418,7 @@ test("pages", () => {
   assert.equal(M.pageIndex("gpu"), 2)
   assert.equal(M.pageIndex("nope"), 0)
   assert.equal(M.pageSource("overview"), "pages/Overview.qml")
-  assert.equal(M.pageSource("cpu"), "pages/Placeholder.qml")
+  assert.equal(M.pageSource("gpu"), "pages/Placeholder.qml")
 })
 
 test("takeLive holds a live batch until there is a profile to send it to", () => {

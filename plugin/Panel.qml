@@ -99,6 +99,24 @@ Panel {
     staged = Model.stage(staged, active, key, value)
   }
 
+  // A key that goes live instead (Curve Optimizer back to 0, a clear) must
+  // not also be applied from the stage.
+  function unstageEdit(key) {
+    if (Model.stagedHas(staged.changes, key)) staged = Model.unstage(staged, key)
+  }
+
+  // What a page control calls: safe values go live, risky ones to the
+  // stage. The risk is decided per value (Model.isRisky), so the same key
+  // can take either route.
+  function edit(key, value) {
+    if (Model.isRisky(key, value, stockGpuW)) {
+      stageEdit(key, value)
+    } else {
+      unstageEdit(key)
+      liveEdit(key, value)
+    }
+  }
+
   function applyStaged() {
     if (Model.stagedCount(staged) === 0) return
     var s = staged
@@ -140,6 +158,8 @@ Panel {
     function revert(): void { root.revert() }
     // A safe live edit from a script: omarchy-shell qqq.oc live cpu.epp power
     function live(key: string, value: string): void { root.liveEdit(key, value) }
+    // The route a page control takes: omarchy-shell qqq.oc edit smu.co_all -5
+    function edit(key: string, value: string): void { root.edit(key, Model.ipcValue(value)) }
   }
 
   onOpenedChanged: {
@@ -235,13 +255,26 @@ Panel {
           onSelected: function(name) { root.cursorActive = false; root.showPage(name) }
         }
 
-        Loader {
-          id: pageLoader
+        // The page, with the stage bar under it on every page.
+        Column {
           width: body.width - rail.width - body.spacing
-          readonly property string src: Model.pageSource(root.page)
-          onSrcChanged: load()
-          Component.onCompleted: load()
-          function load() { setSource(Qt.resolvedUrl(src), { root: root }) }
+          spacing: Style.space(10)
+
+          Loader {
+            id: pageLoader
+            width: parent.width
+            readonly property string src: Model.pageSource(root.page)
+            onSrcChanged: load()
+            Component.onCompleted: load()
+            function load() { setSource(Qt.resolvedUrl(src), { root: root }) }
+          }
+
+          StageBar {
+            width: parent.width
+            root: root
+            onApply: root.applyStaged()
+            onDiscard: root.discardStaged()
+          }
         }
       }
     }

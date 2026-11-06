@@ -23,7 +23,7 @@ var PROFILE_LABELS = { stock: "Stock", eco: "Eco", balanced: "Balanced", perform
 // pages/Placeholder.qml until their task lands.
 var PAGES = [
   { key: "overview", icon: "󰕮", label: "Overview", file: "Overview.qml" },  // 󰕮
-  { key: "cpu",      icon: "󰍛", label: "CPU" },                             // 󰍛
+  { key: "cpu",      icon: "󰍛", label: "CPU", file: "Cpu.qml" },            // 󰍛
   { key: "gpu",      icon: "󰢮", label: "GPU" },                             // 󰢮
   { key: "memory",   icon: "󰘚", label: "Memory" },                          // 󰘚
   { key: "fans",     icon: "󰈐", label: "Fans" },                            // 󰈐
@@ -104,6 +104,16 @@ function stage(staged, profile, key, value) {
 function stagedCount(staged) {
   if (!staged || !staged.changes) return 0
   return Object.keys(staged.changes).length
+}
+
+// Returns a new staged set without `key` (a key that went live instead,
+// such as Curve Optimizer back to 0, must not be applied twice).
+function unstage(staged, key) {
+  var out = emptyStaged()
+  if (!staged) return out
+  out.profile = staged.profile || ""
+  for (var k in staged.changes || {}) if (k !== key) out.changes[k] = staged.changes[k]
+  return out
 }
 
 function splitEdit(changes, stockGpuW) {
@@ -284,6 +294,158 @@ function offlineHint(socketPath) {
     "Start it with:  sudo systemctl enable --now omarchy-ocd"
 }
 
+// ---- CPU page -------------------------------------------------------------
+
+// Slider ranges, mirroring tune::Bounds in the daemon.
+var LIMIT_BOUNDS = {
+  stapm: [10, 200], fast: [10, 200], slow: [10, 200],
+  tctl: [60, 100],
+  tdc: [10, 250], edc: [10, 250], soc_tdc: [10, 250], soc_edc: [10, 250]
+}
+
+// One SMU limit as the PM table reports it: `value` is the limit in force,
+// `use` the live draw against it, `stock` the limit read at first start.
+// `key` is the PM-table stem: fast, slow, stapm, tctl, tdc, edc.
+function limitRow(smu, key) {
+  var b = LIMIT_BOUNDS[key] || [0, 100]
+  var lim = smu && smu.limits ? smu.limits : null
+  var stock = smu && smu.stock ? smu.stock : null
+  return {
+    value: lim ? num(lim[key + "_limit"]) : null,
+    stock: stock ? num(stock[key + "_limit"]) : null,
+    use: lim ? num(lim[key + "_value"]) : null,
+    min: b[0],
+    max: b[1]
+  }
+}
+
+// The limit a slider shows: a staged value first (a staged clear shows the
+// hardware value), then the profile's, then what the PM table reports.
+function shownLimit(stagedChanges, key, tuneValue, liveValue) {
+  if (stagedChanges && Object.prototype.hasOwnProperty.call(stagedChanges, key)) {
+    var s = num(stagedChanges[key])
+    return s !== null ? s : num(liveValue)
+  }
+  var t = num(tuneValue)
+  return t !== null ? t : num(liveValue)
+}
+
+function stagedHas(stagedChanges, key) {
+  return !!stagedChanges && Object.prototype.hasOwnProperty.call(stagedChanges, key)
+}
+
+// Curve Optimizer for all cores, with a staged change on top. Unset is 0.
+function coAll(tune, stagedChanges) {
+  if (stagedHas(stagedChanges, "smu.co_all")) return num(stagedChanges["smu.co_all"]) || 0
+  var v = tune && tune.smu ? num(tune.smu.co_all) : null
+  return v === null ? 0 : v
+}
+
+// One tile per physical core: its Curve Optimizer value (per-core override
+// over the all-core value, staged changes over the profile), tier and the
+// profile's last CPU test verdict. The daemon keeps one verdict per profile,
+// so every core carries it.
+function coreTiles(st, tune, cpuTest, stagedChanges) {
+  var cores = st && st.cpu && st.cpu.cores ? st.cpu.cores : []
+  var all = coAll(tune, stagedChanges)
+  var perCore = tune && tune.smu && tune.smu.co_cores ? tune.smu.co_cores : {}
+  var verdict = cpuTest ? (cpuTest.passed ? "pass" : "fail") : null
+  return cores.map(function(c) {
+    var key = "smu.co_cores." + c.core
+    var own = stagedHas(stagedChanges, key) ? num(stagedChanges[key]) : num(perCore[String(c.core)])
+    return {
+      core: c.core,
+      tier: String(c.tier || ""),
+      co: own !== null ? own : all,
+      override: own !== null,
+      test: verdict
+    }
+  })
+}
+
+// Zen 4 / Zen 4c tiers; a part without dense cores has no tier to show.
+function tierLabel(tier, hasDense) {
+  if (!hasDense) return ""
+  if (tier === "fast") return "Zen 4"
+  if (tier === "dense") return "4c"
+  return String(tier || "")
+}
+
+// The deepest C-state still enabled, or null when none is disabled.
+function idleMax(knobs) {
+  var states = knobs && knobs.idle_states ? knobs.idle_states : []
+  if (states.length === 0) return null
+  var deepest = null
+  for (var i = 0; i < states.length; i++) if (!states[i].disabled) deepest = states[i].name
+  var last = states[states.length - 1]
+  return deepest === null || deepest === last.name ? null : String(deepest)
+}
+
+// "Ryzen 5 8500G · 2× Zen 4 + 4× Zen 4c" and "71° · 38 W".
+function cpuHeadline(st) {
+  var c = st ? st.cpu : null
+  if (!c) return { caption: "", right: "—" }
+  var model = plain(c.model || "").replace(/^AMD\s+/, "").replace(/\s+w\/.*$/, "").replace(/\s+\d+-Core Processor$/, "").trim()
+  var cores = c.cores || []
+  var fast = 0, dense = 0
+  for (var i = 0; i < cores.length; i++) {
+    if (cores[i].tier === "dense") dense++
+    else fast++
+  }
+  var topo = ""
+  if (c.knobs && c.knobs.has_dense && dense > 0) topo = fast + "× Zen 4 + " + dense + "× Zen 4c"
+  else if (cores.length > 0) topo = cores.length + " cores"
+  var caption = [model, topo].filter(function(s) { return s !== "" }).join(" · ")
+  var r = c.reading
+  var right = r ? fmt(r.temp, 0, "°") : "—"
+  if (r && num(r.package_w) !== null) right += " · " + fmt(r.package_w, 0, " W")
+  return { caption: caption, right: right }
+}
+
+// Curve Optimizer value with a real minus sign.
+function fmtCo(v) {
+  var n = num(v)
+  if (n === null) return "—"
+  if (n < 0) return "−" + Math.abs(n)
+  return n > 0 ? "+" + n : "0"
+}
+
+// The TDC/EDC row moves both limits: EDC follows TDC at the stock ratio
+// (1.5 when the stock table is unknown), within the daemon's bounds.
+function edcFor(tdc, stockTdc, stockEdc) {
+  var t = num(stockTdc), e = num(stockEdc)
+  var ratio = t !== null && e !== null && t > 0 ? e / t : 1.5
+  var b = LIMIT_BOUNDS.edc
+  return Math.max(b[0], Math.min(b[1], Math.round((num(tdc) || 0) * ratio)))
+}
+
+// A value typed on the omarchy-shell command line: numbers and booleans as
+// themselves, a clear as null, anything else as the string.
+function ipcValue(s) {
+  if (clears(s)) return null
+  var t = String(s).trim()
+  if (t === "true") return true
+  if (t === "false") return false
+  var n = num(t)
+  return n !== null ? n : t
+}
+
+var EPP_OPTIONS = [
+  { value: "power", label: "power" },
+  { value: "balance_power", label: "bal-pwr" },
+  { value: "balance_performance", label: "bal-perf" },
+  { value: "performance", label: "perf" }
+]
+
+// Empty when the SMU can be driven; otherwise why not (shown next to the
+// disabled limit sliders).
+function smuDisabledReason(st) {
+  var caps = st ? st.caps : null
+  if (caps && caps.smu) return ""
+  var e = caps ? caps.smu_error : null
+  return e ? plain(e) : "SMU unavailable"
+}
+
 // ---- bar ------------------------------------------------------------------
 
 function barLabel(st, alive, mode) {
@@ -362,6 +524,10 @@ if (typeof module !== "undefined") {
     automationLine: automationLine, series: series, cpuTile: cpuTile, gpuTile: gpuTile, memTile: memTile,
     fansTile: fansTile, offlineHint: offlineHint, pendingRemaining: pendingRemaining,
     barLabel: barLabel, tooltip: tooltip, nextFavourite: nextFavourite, reconnect: reconnect,
-    takeLive: takeLive, activeProfile: activeProfile, DISCONNECTED: DISCONNECTED, requestError: requestError
+    takeLive: takeLive, activeProfile: activeProfile, DISCONNECTED: DISCONNECTED, requestError: requestError,
+    unstage: unstage, LIMIT_BOUNDS: LIMIT_BOUNDS, limitRow: limitRow, shownLimit: shownLimit, stagedHas: stagedHas,
+    coAll: coAll, coreTiles: coreTiles, tierLabel: tierLabel, idleMax: idleMax, cpuHeadline: cpuHeadline,
+    smuDisabledReason: smuDisabledReason, fmtCo: fmtCo, edcFor: edcFor, EPP_OPTIONS: EPP_OPTIONS,
+    ipcValue: ipcValue
   }
 }
