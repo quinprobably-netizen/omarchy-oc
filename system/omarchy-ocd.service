@@ -1,0 +1,40 @@
+[Unit]
+Description=Omarchy overclocking daemon (CPU, SMU, GPU, platform)
+Documentation=file:///usr/local/share/doc/omarchy-oc/README.md
+# Fan control is delegated to omarchy-fand; start after it so the fan
+# section is live from the first tick (it is optional).
+After=omarchy-fand.service systemd-modules-load.service
+Wants=omarchy-fand.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/omarchy-ocd run
+# However the daemon exits (even SIGKILL), put every setting back to stock.
+ExecStopPost=/usr/local/bin/omarchy-ocd restore
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=omarchy-oc
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=omarchy-oc
+
+# Needs: sysfs writes (cpufreq, xe, ASPM), the host bridge's PCI config
+# space and /dev/mem (SMU mailbox and PM table), /dev/kmsg (machine-check
+# and GPU-hang watch), other users' /proc/*/fdinfo (per-process GPU use).
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_SYSLOG CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_CHOWN CAP_FOWNER
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# Metrics listener is loopback only.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

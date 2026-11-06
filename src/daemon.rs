@@ -1,0 +1,1175 @@
+//! omarchy-ocd: samples everything once a second, applies profiles, and
+//! keeps them safe:
+//!
+//! * risky settings (SMU limits, Curve Optimizer, raised GPU power) revert
+//!   by themselves unless confirmed within `confirm_seconds`;
+//! * a crash while risky settings were unconfirmed or under test means the
+//!   next boot starts at stock; two crashes with a profile stop it from
+//!   applying at boot;
+//! * the watchdog falls back to a safe profile on overheating, machine
+//!   check errors or GPU hangs;
+//! * settings are re-applied after suspend (the SMU forgets them).
+
+use crate::apply::{Applier, Report};
+use crate::config::{Config, Rule, Stability, TestResult, glob, valid_name};
+use crate::cpu::Cpu;
+use crate::fans::Fans;
+use crate::gpu::Gpu;
+use crate::health::Health;
+use crate::history::{History, SERIES};
+use crate::mem::Mem;
+use crate::platform::Platform;
+use crate::smu::{PmLimits, Smu};
+use crate::tune::{SmuTune, Tune};
+use crate::util::{Sys, now, round1, write_atomic};
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Write as _};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+pub static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Clone, Debug)]
+pub struct Paths {
+    pub run_dir: PathBuf,
+    pub state_dir: PathBuf,
+    pub group: String,
+    pub kmsg: PathBuf,
+}
+
+impl Paths {
+    fn run(&self, f: &str) -> PathBuf {
+        self.run_dir.join(f)
+    }
+    fn state(&self, f: &str) -> PathBuf {
+        self.state_dir.join(f)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Origin {
+    User,
+    Boot,
+    Rule,
+    Watchdog,
+    Revert,
+    Resume,
+}
+
+struct Pending {
+    profile: String,
+    previous: String,
+    deadline: f64,
+}
+
+struct StressState {
+    kind: String,
+    started: f64,
+    profile: String,
+}
+
+pub struct Core {
+    pub sys: Sys,
+    pub paths: Paths,
+    pub cfg: Config,
+    pub cpu: Cpu,
+    pub gpu: Option<Gpu>,
+    pub mem: Mem,
+    pub platform: Platform,
+    pub fans: Fans,
+    applier: Applier,
+    smu: Option<Smu>,
+    smu_family: Option<String>,
+    smu_error: Option<String>,
+    pm: Option<PmLimits>,
+    pm_error: Option<String>,
+    smu_stock: Option<PmLimits>,
+    smu_applied: SmuTune,
+    needs_reboot: Vec<String>,
+    pub active: String,
+    auto_profile: Option<String>,
+    auto_blocked: Option<String>,
+    pending: Option<Pending>,
+    pub message: String,
+    alert: Option<String>,
+    history: History,
+    health: Arc<Health>,
+    health_base: (u64, u64),
+    stress: Option<StressState>,
+    hot_secs: u32,
+    last_auto: f64,
+    last_gap: f64,
+    risky_since: Option<f64>,
+    boot_id: String,
+    pub metrics_latest: Arc<Mutex<String>>,
+    metrics_serving: bool,
+    last_report: Value,
+    /// False for `detect`: sample only, never write.
+    manage: bool,
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(p: &PathBuf) -> Option<T> {
+    std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+fn report_json(r: &Report) -> Value {
+    json!({"changed": r.changed, "errors": r.errors, "notes": r.notes})
+}
+
+impl Core {
+    pub fn new(sys: Sys, paths: Paths) -> Core {
+        Core::build(sys, paths, true)
+    }
+
+    /// Read-only: detect hardware and sample, never write a setting.
+    pub fn passive(sys: Sys, paths: Paths) -> Core {
+        Core::build(sys, paths, false)
+    }
+
+    fn build(sys: Sys, paths: Paths, manage: bool) -> Core {
+        let _ = std::fs::create_dir_all(&paths.run_dir);
+        let _ = std::fs::create_dir_all(&paths.state_dir);
+        let cfg = Config::load(&paths.state("config.json"));
+        let cpu = Cpu::detect(&sys);
+        let gpu = Gpu::detect(&sys).into_iter().next();
+        let mem = Mem::detect(&sys);
+        let platform = Platform::detect(&sys);
+        let fans = Fans::new(&sys);
+        let mut applier = Applier::load(&sys, paths.run("original.json"));
+        let mut knobs = cpu.knob_paths();
+        if let Some(g) = &gpu {
+            knobs.extend(g.knob_paths());
+        }
+        knobs.extend(platform.knob_paths());
+        applier.snapshot(&knobs);
+
+        let smu_family = crate::smu::supported(&cpu.ident.vendor, cpu.ident.family, cpu.ident.model_id).map(String::from);
+        let (smu, smu_error) = match &smu_family {
+            None => (None, Some(format!("no SMU support for {} (family {:#x} model {:#x})", cpu.ident.model, cpu.ident.family, cpu.ident.model_id))),
+            Some(f) => match Smu::open(&sys, f) {
+                Ok(s) => (Some(s), None),
+                Err(e) => (None, Some(e)),
+            },
+        };
+        let smu_applied: SmuTune = read_json(&paths.run("smu-applied.json")).unwrap_or_default();
+        let mut smu_stock: Option<PmLimits> = read_json(&paths.run("smu-stock.json"));
+        let (mut pm, mut pm_error) = (None, None);
+        if let Some(s) = &smu {
+            match s.read_table(&sys) {
+                Ok(t) => pm = Some(t),
+                Err(e) => pm_error = Some(e),
+            }
+        }
+        if smu_stock.is_none() && smu_applied.is_empty() {
+            if let Some(t) = &pm {
+                smu_stock = Some(t.clone());
+                if let Ok(b) = serde_json::to_vec_pretty(t) {
+                    let _ = write_atomic(&paths.run("smu-stock.json"), &b, 0o644);
+                }
+            }
+        }
+        let health = Health::start(paths.kmsg.clone());
+        let boot_id = sys.read("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+        let (mono, boot) = crate::util::clocks();
+        let mut core = Core {
+            sys,
+            paths,
+            cfg,
+            cpu,
+            gpu,
+            mem,
+            platform,
+            fans,
+            applier,
+            smu,
+            smu_family,
+            smu_error,
+            pm,
+            pm_error,
+            smu_stock,
+            smu_applied,
+            needs_reboot: Vec::new(),
+            active: "stock".into(),
+            auto_profile: None,
+            auto_blocked: None,
+            pending: None,
+            message: String::new(),
+            alert: None,
+            history: History::new(3600),
+            health,
+            health_base: (0, 0),
+            stress: None,
+            hot_secs: 0,
+            last_auto: 0.0,
+            last_gap: boot - mono,
+            risky_since: None,
+            boot_id,
+            metrics_latest: Arc::new(Mutex::new(String::new())),
+            metrics_serving: false,
+            last_report: Value::Null,
+            manage,
+        };
+        core.write_info();
+        if manage {
+            core.startup();
+        }
+        core
+    }
+
+    fn stock_gpu_w(&self) -> Option<f64> {
+        self.gpu.as_ref().and_then(|g| g.stock_power_w(&self.applier.originals))
+    }
+
+    fn risky(&self, t: &Tune) -> bool {
+        t.risky(self.stock_gpu_w())
+    }
+
+    fn save_cfg(&self) {
+        if let Err(e) = self.cfg.save(&self.paths.state("config.json")) {
+            eprintln!("omarchy-ocd: saving config: {e}");
+        }
+    }
+
+    /// Crash guard and boot apply.
+    fn startup(&mut self) {
+        let marker = |p: PathBuf| -> Option<(String, String)> {
+            let s = std::fs::read_to_string(&p).ok()?;
+            let mut it = s.lines();
+            Some((it.next()?.to_string(), it.next().unwrap_or("").to_string()))
+        };
+        let mut crashed = false;
+        // Same boot: the daemon itself restarted; carry on where it was.
+        let same_boot_active = marker(self.paths.run("active")).map(|(p, _)| p);
+        if let Some((profile, boot)) = marker(self.paths.state("dirty")) {
+            if boot != self.boot_id {
+                crashed = true;
+                if let Some(t) = self.cfg.profile(&profile) {
+                    let s = self.cfg.stability_mut(&profile, &t);
+                    s.crashes += 1;
+                    s.confirmed = false;
+                }
+                self.alert = Some(format!(
+                    "The last boot ended while \"{profile}\" was unconfirmed or under test. Started at stock settings."
+                ));
+            }
+            let _ = std::fs::remove_file(self.paths.state("dirty"));
+        }
+        if let Some((profile, boot)) = marker(self.paths.state("running")) {
+            if boot != self.boot_id && !crashed {
+                if let Some(t) = self.cfg.profile(&profile).filter(|t| self.risky(t)) {
+                    let s = self.cfg.stability_mut(&profile, &t);
+                    s.crashes += 1;
+                    let crashes = s.crashes;
+                    if crashes >= 2 {
+                        crashed = true;
+                        self.cfg.boot_apply = false;
+                        self.alert = Some(format!(
+                            "\"{profile}\" was active during {crashes} unclean shutdowns in a row. Apply-at-boot is now off."
+                        ));
+                    }
+                }
+            }
+        }
+        self.save_cfg();
+        let target = if let Some(p) = same_boot_active.filter(|p| self.cfg.profile_exists(p)) {
+            Some((p, Origin::Resume))
+        } else if self.cfg.boot_apply && !crashed && self.cfg.base != "stock" {
+            Some((self.cfg.base.clone(), Origin::Boot))
+        } else {
+            None
+        };
+        if let Some((p, origin)) = target {
+            match self.apply_profile(&p, origin) {
+                Ok(_) => self.message = format!("Applied \"{p}\" at start"),
+                Err(e) => self.message = e,
+            }
+        }
+        self.write_running();
+    }
+
+    fn write_running(&self) {
+        let body = format!("{}\n{}\n", self.active, self.boot_id);
+        let _ = write_atomic(&self.paths.state("running"), body.as_bytes(), 0o644);
+        let _ = write_atomic(&self.paths.run("active"), body.as_bytes(), 0o644);
+    }
+
+    fn set_dirty(&self, profile: &str) {
+        let body = format!("{profile}\n{}\n", self.boot_id);
+        let _ = write_atomic(&self.paths.state("dirty"), body.as_bytes(), 0o644);
+        // Make sure it is on disk before anything risky happens.
+        if let Ok(f) = std::fs::File::open(self.paths.state("dirty")) {
+            let _ = f.sync_all();
+        }
+        if let Ok(d) = std::fs::File::open(&self.paths.state_dir) {
+            let _ = d.sync_all();
+        }
+    }
+
+    fn clear_dirty(&self) {
+        if self.pending.is_none() && self.stress.is_none() {
+            let _ = std::fs::remove_file(self.paths.state("dirty"));
+        }
+    }
+
+    pub fn apply_tune(&mut self, t: &Tune) -> Report {
+        let mut writes = self.cpu.plan(&t.cpu);
+        if let Some(g) = &self.gpu {
+            writes.extend(g.plan(&t.gpu));
+        } else if t.gpu != Default::default() {
+            // nothing to do
+        }
+        writes.extend(self.platform.plan(&t.platform));
+        let mut r = self.applier.execute(&writes);
+        match &self.smu {
+            Some(smu) => {
+                let (sent, errs, reboot) = smu.apply(&t.smu, &self.smu_applied, self.smu_stock.as_ref());
+                r.changed.extend(sent.into_iter().map(|s| format!("smu {s}")));
+                r.errors.extend(errs);
+                for x in reboot {
+                    if !self.needs_reboot.contains(&x) {
+                        self.needs_reboot.push(x);
+                    }
+                }
+                self.needs_reboot.retain(|n| !smu_field_set(&t.smu, n));
+                self.smu_applied = t.smu.clone();
+                if let Ok(b) = serde_json::to_vec_pretty(&self.smu_applied) {
+                    let _ = write_atomic(&self.paths.run("smu-applied.json"), &b, 0o644);
+                }
+            }
+            None if !t.smu.is_empty() => {
+                r.errors.push(format!("SMU settings skipped: {}", self.smu_error.clone().unwrap_or_default()));
+            }
+            None => {}
+        }
+        if let Some(fp) = &t.fans.profile {
+            self.fans.sample();
+            if self.fans.available() {
+                match self.fans.set_profile(fp) {
+                    Ok(()) => r.changed.push(format!("fans={fp}")),
+                    Err(e) => r.errors.push(e),
+                }
+            } else {
+                r.notes.push("omarchy-fand is not running; fan profile skipped".into());
+            }
+        }
+        r
+    }
+
+    pub fn apply_profile(&mut self, name: &str, origin: Origin) -> Result<Value, String> {
+        let t = self.cfg.profile(name).ok_or_else(|| format!("no profile named \"{name}\""))?;
+        let risky = self.risky(&t);
+        let confirmed = self.cfg.stable(name, &t).is_some_and(|s| s.confirmed);
+        if risky && !confirmed && matches!(origin, Origin::Boot | Origin::Rule) {
+            return Err(format!(
+                "\"{name}\" has unconfirmed overclock settings; apply it by hand and keep it once before it can apply {}",
+                if origin == Origin::Boot { "at boot" } else { "automatically" }
+            ));
+        }
+        // The safe profile to go back to is the last one that was not pending.
+        let previous = match &self.pending {
+            Some(p) => p.previous.clone(),
+            None => self.active.clone(),
+        };
+        if risky {
+            self.set_dirty(name);
+        }
+        let r = self.apply_tune(&t);
+        self.active = name.to_string();
+        self.health_base = self.health.counts();
+        self.hot_secs = 0;
+        self.risky_since = risky.then(now);
+        if origin == Origin::User {
+            self.cfg.base = name.to_string();
+            self.auto_profile = None;
+            self.auto_blocked = None;
+            self.alert = None;
+        }
+        self.pending = if risky && !confirmed && origin == Origin::User {
+            Some(Pending { profile: name.to_string(), previous, deadline: now() + self.cfg.confirm_seconds as f64 })
+        } else {
+            None
+        };
+        self.clear_dirty();
+        self.save_cfg();
+        self.write_running();
+        let summary = if r.errors.is_empty() {
+            format!("Applied \"{name}\"")
+        } else {
+            format!("Applied \"{name}\" with {} error(s): {}", r.errors.len(), r.errors.join("; "))
+        };
+        self.message = summary;
+        let out = json!({"profile": name, "pending": self.pending.is_some(), "report": report_json(&r)});
+        self.last_report = out.clone();
+        Ok(out)
+    }
+
+    fn confirm(&mut self) -> Result<Value, String> {
+        let p = self.pending.take().ok_or("nothing to confirm")?;
+        if let Some(t) = self.cfg.profile(&p.profile) {
+            let s = self.cfg.stability_mut(&p.profile, &t);
+            s.confirmed = true;
+            s.crashes = 0;
+        }
+        self.clear_dirty();
+        self.save_cfg();
+        self.message = format!("Kept \"{}\"", p.profile);
+        Ok(json!({"profile": p.profile}))
+    }
+
+    fn revert(&mut self, why: &str) -> Result<Value, String> {
+        let p = self.pending.take().ok_or("nothing to revert")?;
+        let r = self.apply_profile(&p.previous, Origin::Revert);
+        self.cfg.base = p.previous.clone();
+        self.save_cfg();
+        self.message = format!("Reverted to \"{}\" ({why})", p.previous);
+        r
+    }
+
+    fn fallback(&mut self, reason: String) {
+        let fb = self.cfg.watchdog.fallback.clone();
+        let fb = if self.cfg.profile_exists(&fb) { fb } else { "stock".into() };
+        self.pending = None;
+        if let Some(a) = self.auto_profile.clone() {
+            self.auto_blocked = Some(a);
+        }
+        let prev = self.active.clone();
+        let _ = self.apply_profile(&fb, Origin::Watchdog);
+        self.alert = Some(format!("Watchdog: {reason}. Switched from \"{prev}\" to \"{fb}\"."));
+        self.message = self.alert.clone().unwrap_or_default();
+    }
+
+    // ---- periodic work ---------------------------------------------------
+
+    pub fn tick(&mut self) {
+        let t = now();
+        self.cpu.sample(t);
+        if let Some(g) = &mut self.gpu {
+            g.sample(t, true);
+        }
+        self.mem.sample();
+        self.platform.sample();
+        self.fans.sample();
+        if let Some(s) = &self.smu {
+            match s.read_table(&self.sys) {
+                Ok(p) => {
+                    self.pm = Some(p);
+                    self.pm_error = None;
+                }
+                Err(e) => self.pm_error = Some(e),
+            }
+        }
+        self.push_history(t);
+        if !self.manage {
+            return;
+        }
+
+        if let Some(p) = &self.pending {
+            if t >= p.deadline {
+                let _ = self.revert("not confirmed in time");
+            }
+        }
+        self.watchdog();
+        if t - self.last_auto >= 2.0 {
+            self.last_auto = t;
+            self.auto_switch();
+        }
+        // Resume from suspend: boot-time clock jumps ahead of monotonic.
+        let (mono, boot) = crate::util::clocks();
+        let gap = boot - mono;
+        if gap - self.last_gap > 2.0 {
+            self.last_gap = gap;
+            self.smu_applied = SmuTune::default();
+            if let Some(tn) = self.cfg.profile(&self.active.clone()) {
+                let r = self.apply_tune(&tn);
+                self.message = format!("Re-applied \"{}\" after resume{}", self.active, if r.errors.is_empty() { "" } else { " (with errors)" });
+            }
+        }
+        self.last_gap = gap;
+        // A risky profile that ran 30 min without a crash clears its count.
+        if let Some(since) = self.risky_since {
+            if t - since > 1800.0 {
+                self.risky_since = None;
+                if let Some(tn) = self.cfg.profile(&self.active) {
+                    let s = self.cfg.stability_mut(&self.active.clone(), &tn);
+                    if s.crashes > 0 {
+                        s.crashes = 0;
+                        self.save_cfg();
+                    }
+                }
+            }
+        }
+        self.write_status();
+    }
+
+    fn push_history(&mut self, t: f64) {
+        let c = &self.cpu.reading;
+        let g = self.gpu.as_ref().map(|g| &g.reading);
+        let gf = |k: &str| g.and_then(|r| r[k].as_f64());
+        let ppt = self.pm.as_ref().and_then(|p| p.fast_value.or(p.stapm_value)).map(|v| v as f64);
+        let gpu_fan = g.and_then(|r| r["fans"].as_array().and_then(|a| a.iter().filter_map(|f| f["rpm"].as_f64()).reduce(f64::max)));
+        let fan_cpu = self.fans.status["fans"]
+            .as_array()
+            .and_then(|a| a.iter().find(|f| f["role"] == "cpu").and_then(|f| f["rpm"].as_f64()));
+        let mem_pct = self.mem.reading()["used_pct"].as_f64();
+        let vals: [Option<f64>; SERIES.len()] = [
+            Some(c.mhz_avg),
+            Some(c.mhz_max),
+            Some(c.util),
+            c.temp,
+            c.package_w,
+            ppt,
+            gf("act_mhz"),
+            gf("temp"),
+            gf("vram_temp"),
+            gf("power_w"),
+            gf("busy"),
+            gpu_fan,
+            mem_pct,
+            fan_cpu,
+        ];
+        self.history.push(t, vals);
+    }
+
+    fn watchdog(&mut self) {
+        let wd = self.cfg.watchdog.clone();
+        if !wd.enabled || self.active == wd.fallback || self.active == "stock" {
+            self.hot_secs = 0;
+            return;
+        }
+        let ct = self.cpu.reading.temp.unwrap_or(0.0);
+        let gt = self.gpu.as_ref().and_then(|g| g.reading["temp"].as_f64()).unwrap_or(0.0);
+        let hot = ct >= wd.cpu_max_c || gt >= wd.gpu_max_c;
+        self.hot_secs = if hot { self.hot_secs + 1 } else { 0 };
+        if self.hot_secs >= wd.seconds.max(1) {
+            let what = if ct >= wd.cpu_max_c { format!("CPU at {ct:.0} °C") } else { format!("GPU at {gt:.0} °C") };
+            self.fallback(format!("{what} for {} s", wd.seconds));
+            return;
+        }
+        if wd.on_errors {
+            let tune = self.cfg.profile(&self.active).unwrap_or_default();
+            if self.risky(&tune) {
+                let (m, g) = self.health.counts();
+                if m > self.health_base.0 {
+                    self.fallback("the kernel logged a machine check (hardware) error".into());
+                } else if g > self.health_base.1 {
+                    self.fallback("the GPU hung or reset".into());
+                }
+            }
+        }
+    }
+
+    fn auto_switch(&mut self) {
+        if !self.cfg.auto_switch || self.cfg.rules.is_empty() || self.pending.is_some() || self.stress.is_some() {
+            return;
+        }
+        let procs = processes(&self.sys, self.cfg.rules.iter().any(|r| r.matcher == "gamemode"));
+        let want = self.cfg.rules.iter().find(|r| rule_matches(r, &procs)).map(|r| r.profile.clone());
+        if want == self.auto_profile {
+            return;
+        }
+        match &want {
+            Some(p) if self.auto_blocked.as_ref() == Some(p) => return,
+            Some(p) => match self.apply_profile(p, Origin::Rule) {
+                Ok(_) => self.message = format!("Auto: switched to \"{p}\""),
+                Err(e) => {
+                    self.message = format!("Auto: {e}");
+                    self.auto_blocked = Some(p.clone());
+                    return;
+                }
+            },
+            None => {
+                let base = self.cfg.base.clone();
+                let _ = self.apply_profile(&base, Origin::Rule);
+                self.message = format!("Auto: back to \"{base}\"");
+                self.auto_blocked = None;
+            }
+        }
+        self.auto_profile = want;
+    }
+
+    // ---- output ------------------------------------------------------------
+
+    fn write_info(&self) {
+        let info = json!({
+            "version": VERSION,
+            "cpu": self.cpu.ident,
+            "cpu_tiers": self.cpu.tier_counts(),
+            "threads": self.cpu.threads,
+            "gpu": self.gpu.as_ref().map(|g| g.ident.clone()),
+            "mem": self.mem.info(),
+            "platform": self.platform.ident,
+            "smu": {"family": self.smu_family, "available": self.smu.is_some(), "error": self.smu_error, "stock": self.smu_stock},
+        });
+        if let Ok(b) = serde_json::to_vec_pretty(&info) {
+            let _ = write_atomic(&self.paths.run("info.json"), &b, 0o644);
+        }
+    }
+
+    pub fn status(&self, history: usize) -> Value {
+        let t = now();
+        let profiles: Vec<Value> = self
+            .cfg
+            .names()
+            .into_iter()
+            .filter_map(|n| {
+                let tune = self.cfg.profile(&n)?;
+                let st = self.cfg.stable(&n, &tune).cloned().unwrap_or_default();
+                Some(json!({
+                    "name": n,
+                    "builtin": Config::is_builtin(&n),
+                    "risky": self.risky(&tune),
+                    "confirmed": st.confirmed,
+                    "crashes": st.crashes,
+                    "cpu_test": st.cpu,
+                    "gpu_test": st.gpu,
+                    "tune": tune,
+                }))
+            })
+            .collect();
+        let (mce, hangs) = self.health.counts();
+        json!({
+            "time": round1(t),
+            "version": VERSION,
+            "active": self.active,
+            "base": self.cfg.base,
+            "auto_profile": self.auto_profile,
+            "boot_apply": self.cfg.boot_apply,
+            "auto_switch": self.cfg.auto_switch,
+            "pending": self.pending.as_ref().map(|p| json!({"profile": p.profile, "previous": p.previous, "remaining": (p.deadline - t).max(0.0).round()})),
+            "message": self.message,
+            "alert": self.alert,
+            "caps": {
+                "smu": self.smu.is_some(),
+                "smu_family": self.smu_family,
+                "smu_error": self.smu_error,
+                "pm_table": self.pm.is_some(),
+                "pm_error": self.pm_error,
+                "gpu": self.gpu.is_some(),
+                "fans": self.fans.available(),
+            },
+            "cpu": {"model": self.cpu.ident.model, "reading": self.cpu.reading, "knobs": self.cpu.knobs(),
+                    "cores": self.cpu.threads.iter().filter(|t| t.cpu == *self.cpu.threads.iter().filter(|u| u.core == t.core).map(|u| &u.cpu).min().unwrap_or(&t.cpu)).map(|t| json!({"core": t.core, "tier": t.tier, "cpu": t.cpu})).collect::<Vec<_>>()},
+            "smu": {"limits": self.pm, "stock": self.smu_stock, "applied": self.smu_applied, "needs_reboot": self.needs_reboot},
+            "gpu": self.gpu.as_ref().map(|g| json!({"name": g.ident["name"], "reading": g.reading, "knobs": g.knobs(), "procs": g.procs})),
+            "mem": {"reading": self.mem.reading()},
+            "platform": {"reading": self.platform.reading, "knobs": self.platform.knobs()},
+            "fans": self.fans.summary(),
+            "profiles": profiles,
+            "rules": self.cfg.rules,
+            "watchdog": self.cfg.watchdog,
+            "metrics": {"http": self.cfg.metrics.http, "listen": self.cfg.metrics.listen, "serving": self.metrics_serving},
+            "confirm_seconds": self.cfg.confirm_seconds,
+            "stress": self.stress.as_ref().map(|s| json!({"kind": s.kind, "started": s.started, "profile": s.profile})),
+            "health": {"mce": mce, "gpu_hangs": hangs, "recent": self.health.last.lock().map(|v| v.clone()).unwrap_or_default()},
+            "last_report": self.last_report,
+            "history": self.history.tail(history),
+        })
+    }
+
+    fn write_status(&mut self) {
+        let st = self.status(180);
+        if let Ok(b) = serde_json::to_vec(&st) {
+            let _ = write_atomic(&self.paths.run("status.json"), &b, 0o644);
+        }
+        let prom = crate::metrics::render(&st);
+        let _ = write_atomic(&self.paths.run("metrics.prom"), prom.as_bytes(), 0o644);
+        if let Ok(mut l) = self.metrics_latest.lock() {
+            *l = prom;
+        }
+    }
+
+    pub fn start_metrics(&mut self) {
+        if self.cfg.metrics.http && !self.metrics_serving {
+            match crate::metrics::serve(&self.cfg.metrics.listen, self.metrics_latest.clone()) {
+                Ok(()) => self.metrics_serving = true,
+                Err(e) => self.message = format!("metrics listener {}: {e}", self.cfg.metrics.listen),
+            }
+        }
+    }
+
+    /// Hand everything back (daemon exit).
+    pub fn shutdown(&mut self) {
+        let _ = self.apply_tune(&Tune::default());
+        let _ = std::fs::remove_file(self.paths.state("running"));
+        let _ = std::fs::remove_file(self.paths.run("active"));
+        if self.pending.is_none() && self.stress.is_none() {
+            let _ = std::fs::remove_file(self.paths.state("dirty"));
+        }
+    }
+
+    // ---- requests ------------------------------------------------------------
+
+    pub fn handle(&mut self, req: &Value) -> Result<Value, String> {
+        let s = |k: &str| req.get(k).and_then(Value::as_str);
+        let b = |k: &str| req.get(k).and_then(Value::as_bool);
+        let name_arg = |k: &str| -> Result<String, String> {
+            let n = s(k).ok_or_else(|| format!("missing \"{k}\""))?;
+            Ok(n.to_string())
+        };
+        match s("cmd").unwrap_or("") {
+            "status" => Ok(self.status(req.get("history").and_then(Value::as_u64).unwrap_or(180) as usize)),
+            "info" => {
+                self.write_info();
+                read_json(&self.paths.run("info.json")).ok_or_else(|| "no info".into())
+            }
+            "apply" => {
+                let p = name_arg("profile")?;
+                self.apply_profile(&p, Origin::User)
+            }
+            "confirm" => self.confirm(),
+            "revert" => self.revert("by request"),
+            "set" => {
+                let p = name_arg("profile")?;
+                let key = name_arg("key")?;
+                let val = s("value").unwrap_or("").to_string();
+                if Config::is_builtin(&p) {
+                    return Err(format!("\"{p}\" is built in; copy it first (omarchy-oc copy {p} my-{p})"));
+                }
+                let mut t = self.cfg.profiles.get(&p).cloned().ok_or_else(|| format!("no profile named \"{p}\""))?;
+                t.set_key(&key, &val)?;
+                self.cfg.profiles.insert(p.clone(), t);
+                self.save_cfg();
+                self.reapply_if_active(&p)
+            }
+            "save" => {
+                let p = name_arg("profile")?;
+                if Config::is_builtin(&p) {
+                    return Err(format!("\"{p}\" is built in"));
+                }
+                if !valid_name(&p) {
+                    return Err("profile names are letters, digits, - and _ (max 32)".into());
+                }
+                let t: Tune = serde_json::from_value(req.get("tune").cloned().unwrap_or_default()).map_err(|e| format!("tune: {e}"))?;
+                t.validate()?;
+                self.cfg.profiles.insert(p.clone(), t);
+                self.save_cfg();
+                self.reapply_if_active(&p)
+            }
+            "copy" => {
+                let from = name_arg("from")?;
+                let to = name_arg("to")?;
+                if !valid_name(&to) || Config::is_builtin(&to) {
+                    return Err(format!("\"{to}\" is not a usable profile name"));
+                }
+                let t = self.cfg.profile(&from).ok_or_else(|| format!("no profile named \"{from}\""))?;
+                self.cfg.profiles.insert(to.clone(), t);
+                self.save_cfg();
+                Ok(json!({"profile": to}))
+            }
+            "rename" => {
+                let from = name_arg("from")?;
+                let to = name_arg("to")?;
+                if !valid_name(&to) || Config::is_builtin(&to) || self.cfg.profile_exists(&to) {
+                    return Err(format!("\"{to}\" is not a usable profile name"));
+                }
+                let t = self.cfg.profiles.remove(&from).ok_or_else(|| format!("no user profile named \"{from}\""))?;
+                self.cfg.profiles.insert(to.clone(), t);
+                if let Some(st) = self.cfg.stability.remove(&from) {
+                    self.cfg.stability.insert(to.clone(), st);
+                }
+                for r in &mut self.cfg.rules {
+                    if r.profile == from {
+                        r.profile = to.clone();
+                    }
+                }
+                if self.cfg.base == from {
+                    self.cfg.base = to.clone();
+                }
+                if self.active == from {
+                    self.active = to.clone();
+                }
+                self.save_cfg();
+                Ok(json!({"profile": to}))
+            }
+            "delete" => {
+                let p = name_arg("profile")?;
+                if self.active == p {
+                    return Err("switch to another profile first".into());
+                }
+                self.cfg.profiles.remove(&p).ok_or_else(|| format!("no user profile named \"{p}\""))?;
+                self.cfg.stability.remove(&p);
+                self.cfg.rules.retain(|r| r.profile != p);
+                self.save_cfg();
+                Ok(json!({}))
+            }
+            "boot" => {
+                self.cfg.boot_apply = b("enabled").ok_or("missing \"enabled\"")?;
+                self.save_cfg();
+                Ok(json!({"boot_apply": self.cfg.boot_apply}))
+            }
+            "auto" => {
+                self.cfg.auto_switch = b("enabled").ok_or("missing \"enabled\"")?;
+                if !self.cfg.auto_switch && self.auto_profile.take().is_some() {
+                    let base = self.cfg.base.clone();
+                    let _ = self.apply_profile(&base, Origin::Rule);
+                }
+                self.auto_blocked = None;
+                self.save_cfg();
+                Ok(json!({"auto_switch": self.cfg.auto_switch}))
+            }
+            "rule-add" => {
+                let matcher = name_arg("matcher")?;
+                let profile = name_arg("profile")?;
+                if !(matcher.starts_with("process:") && matcher.len() > 8 || matcher == "steam-game" || matcher == "gamemode") {
+                    return Err("matcher must be process:<glob>, steam-game or gamemode".into());
+                }
+                if !self.cfg.profile_exists(&profile) {
+                    return Err(format!("no profile named \"{profile}\""));
+                }
+                self.cfg.rules.push(Rule { matcher, profile });
+                self.save_cfg();
+                Ok(json!({"rules": self.cfg.rules}))
+            }
+            "rule-del" => {
+                let i = req.get("index").and_then(Value::as_u64).ok_or("missing \"index\"")? as usize;
+                if i >= self.cfg.rules.len() {
+                    return Err("no such rule".into());
+                }
+                self.cfg.rules.remove(i);
+                self.save_cfg();
+                Ok(json!({"rules": self.cfg.rules}))
+            }
+            "watchdog" => {
+                let w = &mut self.cfg.watchdog;
+                if let Some(v) = b("enabled") {
+                    w.enabled = v;
+                }
+                if let Some(v) = b("on_errors") {
+                    w.on_errors = v;
+                }
+                if let Some(v) = req.get("cpu_max_c").and_then(Value::as_f64) {
+                    w.cpu_max_c = v.clamp(60.0, 105.0);
+                }
+                if let Some(v) = req.get("gpu_max_c").and_then(Value::as_f64) {
+                    w.gpu_max_c = v.clamp(60.0, 110.0);
+                }
+                if let Some(v) = req.get("seconds").and_then(Value::as_u64) {
+                    w.seconds = (v as u32).clamp(1, 120);
+                }
+                if let Some(v) = s("fallback") {
+                    if !self.cfg.profile_exists(v) {
+                        return Err(format!("no profile named \"{v}\""));
+                    }
+                    self.cfg.watchdog.fallback = v.to_string();
+                }
+                self.save_cfg();
+                Ok(serde_json::to_value(&self.cfg.watchdog).unwrap_or_default())
+            }
+            "metrics" => {
+                if let Some(v) = b("http") {
+                    self.cfg.metrics.http = v;
+                }
+                if let Some(v) = s("listen") {
+                    let a: std::net::SocketAddr = v.parse().map_err(|_| format!("bad address {v}"))?;
+                    if !a.ip().is_loopback() {
+                        return Err("the metrics listener only binds loopback addresses".into());
+                    }
+                    self.cfg.metrics.listen = v.to_string();
+                }
+                self.save_cfg();
+                self.start_metrics();
+                Ok(json!({"http": self.cfg.metrics.http, "listen": self.cfg.metrics.listen, "serving": self.metrics_serving,
+                          "note": if self.metrics_serving && !self.cfg.metrics.http { "listener stops at next daemon restart" } else { "" }}))
+            }
+            "confirm-seconds" => {
+                let v = req.get("seconds").and_then(Value::as_u64).ok_or("missing \"seconds\"")?;
+                self.cfg.confirm_seconds = (v as u32).clamp(5, 300);
+                self.save_cfg();
+                Ok(json!({"confirm_seconds": self.cfg.confirm_seconds}))
+            }
+            "stress-begin" => {
+                let kind = s("kind").unwrap_or("cpu").to_string();
+                if self.pending.is_some() {
+                    return Err("confirm or revert the pending settings first".into());
+                }
+                self.set_dirty(&self.active.clone());
+                self.stress = Some(StressState { kind, started: now(), profile: self.active.clone() });
+                self.health_base = self.health.counts();
+                Ok(json!({"profile": self.active}))
+            }
+            "stress-end" => {
+                let st = self.stress.take().ok_or("no stress test running")?;
+                let (m, g) = self.health.counts();
+                let hw_errors = (m - self.health_base.0) + if st.kind == "gpu" { g - self.health_base.1 } else { 0 };
+                let errors = req.get("errors").and_then(Value::as_u64).unwrap_or(0) + hw_errors;
+                let completed = b("completed").unwrap_or(true);
+                let passed = b("passed").unwrap_or(false) && hw_errors == 0;
+                let mut detail = s("detail").unwrap_or("").to_string();
+                if hw_errors > 0 {
+                    detail = format!("{detail} {hw_errors} kernel-reported hardware error(s)").trim().to_string();
+                }
+                let res = TestResult {
+                    time: now(),
+                    seconds: req.get("seconds").and_then(Value::as_f64).unwrap_or(now() - st.started),
+                    passed,
+                    errors,
+                    detail,
+                };
+                if completed || !passed {
+                    if let Some(t) = self.cfg.profile(&st.profile) {
+                        let rec: &mut Stability = self.cfg.stability_mut(&st.profile, &t);
+                        if st.kind == "gpu" {
+                            rec.gpu = Some(res.clone());
+                        } else {
+                            rec.cpu = Some(res.clone());
+                        }
+                    }
+                }
+                self.clear_dirty();
+                self.save_cfg();
+                Ok(json!({"profile": st.profile, "result": res}))
+            }
+            "history" => Ok(self.history.tail(req.get("seconds").and_then(Value::as_u64).unwrap_or(3600) as usize)),
+            "csv" => Ok(Value::String(self.history.csv(req.get("seconds").and_then(Value::as_f64)))),
+            "export" => {
+                let p = name_arg("profile")?;
+                let t = self.cfg.profile(&p).ok_or_else(|| format!("no profile named \"{p}\""))?;
+                Ok(json!({"omarchy_oc_profile": 1, "name": p, "tune": t}))
+            }
+            "fans" => fans_proxy(&self.fans, req),
+            "clear-alert" => {
+                self.alert = None;
+                Ok(json!({}))
+            }
+            "probe" => Ok(json!({
+                "smu_family": self.smu_family, "smu": self.smu.is_some(), "smu_error": self.smu_error,
+                "pm_table": self.pm, "pm_error": self.pm_error, "stock": self.smu_stock,
+                "originals": self.applier.originals.len(),
+            })),
+            other => Err(format!("unknown command \"{other}\"")),
+        }
+    }
+
+    fn reapply_if_active(&mut self, p: &str) -> Result<Value, String> {
+        if self.active == p { self.apply_profile(p, Origin::User) } else { Ok(json!({"profile": p, "applied": false})) }
+    }
+}
+
+/// Forward a fan request to omarchy-fand (the fan backend); only its
+/// control commands pass.
+pub fn fans_proxy(fans: &Fans, req: &Value) -> Result<Value, String> {
+    let inner = req.get("req").cloned().ok_or("missing \"req\"")?;
+    let c = inner.get("cmd").and_then(Value::as_str).unwrap_or("");
+    const ALLOWED: [&str; 9] = ["status", "profile", "curve", "tuning", "fan", "calibrate", "retest", "mode", "rescan"];
+    if !ALLOWED.contains(&c) {
+        return Err(format!("fans: command \"{c}\" is not allowed"));
+    }
+    fans.call(&inner)
+}
+
+fn smu_field_set(t: &SmuTune, name: &str) -> bool {
+    match name {
+        "stapm" => t.stapm_w.is_some(),
+        "fast" => t.fast_w.is_some(),
+        "slow" => t.slow_w.is_some(),
+        "tctl" => t.tctl_c.is_some(),
+        "tdc" => t.tdc_a.is_some(),
+        "edc" => t.edc_a.is_some(),
+        "soc_tdc" => t.soc_tdc_a.is_some(),
+        "soc_edc" => t.soc_edc_a.is_some(),
+        _ => false,
+    }
+}
+
+pub struct Proc {
+    pub comm: String,
+    pub argv0: String,
+    pub cmdline: String,
+    pub gamemode: bool,
+}
+
+pub fn processes(sys: &Sys, want_env: bool) -> Vec<Proc> {
+    let mut v = Vec::new();
+    for p in sys.list("/proc") {
+        if !p.file_name().is_some_and(|n| n.to_string_lossy().bytes().all(|b| b.is_ascii_digit())) {
+            continue;
+        }
+        let Some(comm) = crate::util::read_trim(&p.join("comm")) else { continue };
+        let raw = std::fs::read(p.join("cmdline")).unwrap_or_default();
+        if raw.is_empty() {
+            continue; // kernel thread
+        }
+        let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+        let first = raw.split(|b| *b == 0).next().unwrap_or_default();
+        let argv0 = String::from_utf8_lossy(first).rsplit(['/', '\\']).next().unwrap_or("").to_string();
+        let gamemode = want_env
+            && (comm == "gamemoderun"
+                || std::fs::read(p.join("environ")).is_ok_and(|e| e.windows(15).any(|w| w == b"libgamemodeauto")));
+        v.push(Proc { comm, argv0, cmdline, gamemode });
+    }
+    v
+}
+
+pub fn rule_matches(r: &Rule, procs: &[Proc]) -> bool {
+    if let Some(pat) = r.matcher.strip_prefix("process:") {
+        return procs.iter().any(|p| glob(pat, &p.comm) || glob(pat, &p.argv0));
+    }
+    match r.matcher.as_str() {
+        // Steam starts every game under `reaper SteamLaunch AppId=N`.
+        "steam-game" => procs.iter().any(|p| p.comm == "reaper" && p.cmdline.contains("SteamLaunch") && !p.cmdline.contains("AppId=0 ")),
+        "gamemode" => procs.iter().any(|p| p.gamemode),
+        _ => false,
+    }
+}
+
+// ---- socket server -------------------------------------------------------------
+
+fn group_id(name: &str) -> Option<libc::gid_t> {
+    let c = std::ffi::CString::new(name).ok()?;
+    let g = unsafe { libc::getgrnam(c.as_ptr()) };
+    if g.is_null() { None } else { Some(unsafe { (*g).gr_gid }) }
+}
+
+fn serve_client(core: Arc<Mutex<Core>>, stream: UnixStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let mut w = match stream.try_clone() {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+    let mut line = String::new();
+    if BufReader::new(stream).take_line(&mut line).is_err() {
+        return;
+    }
+    let reply = match serde_json::from_str::<Value>(&line) {
+        // Fan commands go straight to omarchy-fand without holding the core
+        // lock: calibration takes minutes.
+        Ok(req) if req.get("cmd").and_then(Value::as_str) == Some("fans") => {
+            let sys = match core.lock() {
+                Ok(c) => c.sys.clone(),
+                Err(p) => p.into_inner().sys.clone(),
+            };
+            match fans_proxy(&Fans::new(&sys), &req) {
+                Ok(v) => json!({"ok": true, "result": v}),
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+        Ok(req) => {
+            let mut c = match core.lock() {
+                Ok(c) => c,
+                Err(p) => p.into_inner(),
+            };
+            match c.handle(&req) {
+                Ok(v) => json!({"ok": true, "result": v}),
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+        Err(_) => json!({"ok": false, "error": "request is not JSON"}),
+    };
+    let _ = w.write_all(format!("{reply}\n").as_bytes());
+}
+
+trait TakeLine {
+    fn take_line(self, buf: &mut String) -> std::io::Result<usize>;
+}
+impl<R: std::io::Read> TakeLine for BufReader<R> {
+    fn take_line(self, buf: &mut String) -> std::io::Result<usize> {
+        // Cap requests at 256 KiB.
+        use std::io::Read;
+        let mut limited = BufReader::new(self.take(256 * 1024));
+        limited.read_line(buf)
+    }
+}
+
+pub fn run(sys: Sys, paths: Paths) -> std::io::Result<()> {
+    let core = Arc::new(Mutex::new(Core::new(sys, paths.clone())));
+    if let Ok(mut c) = core.lock() {
+        c.start_metrics();
+        c.tick();
+    }
+    let sock = paths.run("control.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let gid = group_id(&paths.group);
+        if let (Some(gid), Ok(c)) = (gid, std::ffi::CString::new(sock.to_string_lossy().as_bytes())) {
+            unsafe { libc::chown(c.as_ptr(), 0, gid) };
+        }
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(if gid.is_some() { 0o660 } else { 0o600 }))?;
+    }
+    let lc = core.clone();
+    std::thread::spawn(move || {
+        let slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for s in listener.incoming().flatten() {
+            if slots.load(Ordering::Relaxed) >= 16 {
+                continue;
+            }
+            slots.fetch_add(1, Ordering::Relaxed);
+            let (c, sl) = (lc.clone(), slots.clone());
+            std::thread::spawn(move || {
+                serve_client(c, s);
+                sl.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
+    });
+    let mut next = std::time::Instant::now();
+    while !SIGNAL_STOP.load(Ordering::Relaxed) {
+        next += Duration::from_secs(1);
+        if let Ok(mut c) = core.lock() {
+            c.tick();
+        }
+        let now_i = std::time::Instant::now();
+        if next > now_i {
+            std::thread::sleep(next - now_i);
+        } else {
+            next = now_i;
+        }
+    }
+    if let Ok(mut c) = core.lock() {
+        c.shutdown();
+    }
+    let _ = std::fs::remove_file(&sock);
+    Ok(())
+}
+
+/// `omarchy-ocd restore`: put back every snapshotted knob and the SMU stock
+/// limits, without a running daemon (systemd ExecStopPost).
+pub fn restore(sys: Sys, paths: Paths) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut a = Applier::load(&sys, paths.run("original.json"));
+    let r = a.restore_all();
+    out.extend(r.changed.iter().map(|c| format!("restored {c}")));
+    out.extend(r.errors.iter().map(|e| format!("error: {e}")));
+    let applied: SmuTune = read_json(&paths.run("smu-applied.json")).unwrap_or_default();
+    if !applied.is_empty() {
+        let stock: Option<PmLimits> = read_json(&paths.run("smu-stock.json"));
+        let cpu = Cpu::detect(&sys);
+        if let Some(f) = crate::smu::supported(&cpu.ident.vendor, cpu.ident.family, cpu.ident.model_id) {
+            match Smu::open(&sys, f) {
+                Ok(s) => {
+                    let (sent, errs, reboot) = s.apply(&SmuTune::default(), &applied, stock.as_ref());
+                    out.extend(sent.into_iter().map(|x| format!("smu {x}")));
+                    out.extend(errs.into_iter().map(|e| format!("error: {e}")));
+                    if !reboot.is_empty() {
+                        out.push(format!("reboot to restore: {}", reboot.join(", ")));
+                    }
+                    let _ = std::fs::remove_file(paths.run("smu-applied.json"));
+                }
+                Err(e) => out.push(format!("error: SMU: {e}")),
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(comm: &str, cmd: &str) -> Proc {
+        Proc { comm: comm.into(), argv0: cmd.split(' ').next().unwrap_or("").rsplit('/').next().unwrap_or("").into(), cmdline: cmd.into(), gamemode: false }
+    }
+
+    #[test]
+    fn rules() {
+        let procs = vec![p("reaper", "/home/u/.steam/reaper SteamLaunch AppId=1091500 -- foo"), p("blender", "/usr/bin/blender")];
+        assert!(rule_matches(&Rule { matcher: "steam-game".into(), profile: "max".into() }, &procs));
+        assert!(rule_matches(&Rule { matcher: "process:blend*".into(), profile: "max".into() }, &procs));
+        assert!(!rule_matches(&Rule { matcher: "process:gimp".into(), profile: "max".into() }, &procs));
+        assert!(!rule_matches(&Rule { matcher: "gamemode".into(), profile: "max".into() }, &procs));
+    }
+}

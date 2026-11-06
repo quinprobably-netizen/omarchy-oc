@@ -1,0 +1,20 @@
+[package]
+name = "omarchy-oc"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Overclocking and tuning daemon, CLI and Omarchy shell plugin: Ryzen SMU, amd-pstate, Intel Arc (xe), memory, platform and fans"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+panic = "unwind"
+
+[workspace]
+exclude = ["gpustress"]

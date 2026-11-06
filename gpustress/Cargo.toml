@@ -1,0 +1,22 @@
+[package]
+name = "omarchy-oc-gpustress"
+version = "0.1.0"
+edition = "2024"
+description = "GPU stability tester / error detector for validating GPU overclocks"
+
+[[bin]]
+name = "omarchy-oc-gpustress"
+path = "src/main.rs"
+
+[dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["vulkan", "wgsl", "std", "parking_lot"] }
+pollster = "0.4.0"
+bytemuck = "1"
+libc = "0.2"
+ash = { version = "=0.38.0", default-features = false }
+
+[workspace]
+
+[profile.release]
+lto = true
+strip = true
